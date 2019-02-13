@@ -1,9 +1,8 @@
 //===-- HexagonTargetMachine.cpp - Define TargetMachine for Hexagon -------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -27,6 +26,9 @@
 #include "llvm/Transforms/Scalar.h"
 
 using namespace llvm;
+
+static cl::opt<bool> EnableCExtOpt("hexagon-cext", cl::Hidden, cl::ZeroOrMore,
+  cl::init(true), cl::desc("Enable Hexagon constant-extender optimization"));
 
 static cl::opt<bool> EnableRDFOpt("rdf-opt", cl::Hidden, cl::ZeroOrMore,
   cl::init(true), cl::desc("Enable RDF-based optimizations"));
@@ -91,9 +93,12 @@ static cl::opt<bool> EnableVectorPrint("enable-hexagon-vector-print",
   cl::Hidden, cl::ZeroOrMore, cl::init(false),
   cl::desc("Enable Hexagon Vector print instr pass"));
 
-static cl::opt<bool> EnableTrapUnreachable("hexagon-trap-unreachable",
-  cl::Hidden, cl::ZeroOrMore, cl::init(false),
-  cl::desc("Enable generating trap for unreachable"));
+static cl::opt<bool> EnableVExtractOpt("hexagon-opt-vextract", cl::Hidden,
+  cl::ZeroOrMore, cl::init(true), cl::desc("Enable vextract optimization"));
+
+static cl::opt<bool> EnableInitialCFGCleanup("hexagon-initial-cfg-cleanup",
+  cl::Hidden, cl::ZeroOrMore, cl::init(true),
+  cl::desc("Simplify the CFG after atomic expansion pass"));
 
 /// HexagonTargetMachineModule - Note that this is used on hosts that
 /// cannot link in a library unless there are references into the
@@ -119,14 +124,21 @@ SchedCustomRegistry("hexagon", "Run Hexagon's custom scheduler",
 
 namespace llvm {
   extern char &HexagonExpandCondsetsID;
+  void initializeHexagonBitSimplifyPass(PassRegistry&);
+  void initializeHexagonConstExtendersPass(PassRegistry&);
+  void initializeHexagonConstPropagationPass(PassRegistry&);
   void initializeHexagonEarlyIfConversionPass(PassRegistry&);
   void initializeHexagonExpandCondsetsPass(PassRegistry&);
   void initializeHexagonGenMuxPass(PassRegistry&);
+  void initializeHexagonHardwareLoopsPass(PassRegistry&);
   void initializeHexagonLoopIdiomRecognizePass(PassRegistry&);
   void initializeHexagonVectorLoopCarriedReusePass(PassRegistry&);
   void initializeHexagonNewValueJumpPass(PassRegistry&);
   void initializeHexagonOptAddrModePass(PassRegistry&);
   void initializeHexagonPacketizerPass(PassRegistry&);
+  void initializeHexagonRDFOptPass(PassRegistry&);
+  void initializeHexagonSplitDoubleRegsPass(PassRegistry&);
+  void initializeHexagonVExtractPass(PassRegistry&);
   Pass *createHexagonLoopIdiomPass();
   Pass *createHexagonVectorLoopCarriedReusePass();
 
@@ -135,6 +147,7 @@ namespace llvm {
   FunctionPass *createHexagonCallFrameInformation();
   FunctionPass *createHexagonCFGOptimizer();
   FunctionPass *createHexagonCommonGEP();
+  FunctionPass *createHexagonConstExtenders();
   FunctionPass *createHexagonConstPropagationPass();
   FunctionPass *createHexagonCopyToCombine();
   FunctionPass *createHexagonEarlyIfConversion();
@@ -150,13 +163,14 @@ namespace llvm {
   FunctionPass *createHexagonNewValueJump();
   FunctionPass *createHexagonOptimizeSZextends();
   FunctionPass *createHexagonOptAddrMode();
-  FunctionPass *createHexagonPacketizer();
+  FunctionPass *createHexagonPacketizer(bool Minimal);
   FunctionPass *createHexagonPeephole();
   FunctionPass *createHexagonRDFOpt();
   FunctionPass *createHexagonSplitConst32AndConst64();
   FunctionPass *createHexagonSplitDoubleRegs();
   FunctionPass *createHexagonStoreWidening();
   FunctionPass *createHexagonVectorPrint();
+  FunctionPass *createHexagonVExtract();
 } // end namespace llvm;
 
 static Reloc::Model getEffectiveRelocModel(Optional<Reloc::Model> RM) {
@@ -165,24 +179,25 @@ static Reloc::Model getEffectiveRelocModel(Optional<Reloc::Model> RM) {
   return *RM;
 }
 
-static CodeModel::Model getEffectiveCodeModel(Optional<CodeModel::Model> CM) {
-  if (CM)
-    return *CM;
-  return CodeModel::Small;
-}
-
 extern "C" void LLVMInitializeHexagonTarget() {
   // Register the target.
   RegisterTargetMachine<HexagonTargetMachine> X(getTheHexagonTarget());
 
   PassRegistry &PR = *PassRegistry::getPassRegistry();
+  initializeHexagonBitSimplifyPass(PR);
+  initializeHexagonConstExtendersPass(PR);
+  initializeHexagonConstPropagationPass(PR);
   initializeHexagonEarlyIfConversionPass(PR);
   initializeHexagonGenMuxPass(PR);
+  initializeHexagonHardwareLoopsPass(PR);
   initializeHexagonLoopIdiomRecognizePass(PR);
   initializeHexagonVectorLoopCarriedReusePass(PR);
   initializeHexagonNewValueJumpPass(PR);
   initializeHexagonOptAddrModePass(PR);
   initializeHexagonPacketizerPass(PR);
+  initializeHexagonRDFOptPass(PR);
+  initializeHexagonSplitDoubleRegsPass(PR);
+  initializeHexagonVExtractPass(PR);
 }
 
 HexagonTargetMachine::HexagonTargetMachine(const Target &T, const Triple &TT,
@@ -200,10 +215,9 @@ HexagonTargetMachine::HexagonTargetMachine(const Target &T, const Triple &TT,
           "i64:64:64-i32:32:32-i16:16:16-i1:8:8-f32:32:32-f64:64:64-"
           "v32:32:32-v64:64:64-v512:512:512-v1024:1024:1024-v2048:2048:2048",
           TT, CPU, FS, Options, getEffectiveRelocModel(RM),
-          getEffectiveCodeModel(CM), (HexagonNoOpt ? CodeGenOpt::None : OL)),
+          getEffectiveCodeModel(CM, CodeModel::Small),
+          (HexagonNoOpt ? CodeGenOpt::None : OL)),
       TLOF(make_unique<HexagonTargetObjectFile>()) {
-  if (EnableTrapUnreachable)
-    this->Options.TrapUnreachable = true;
   initializeHexagonExpandCondsetsPass(*PassRegistry::getPassRegistry());
   initAsmInfo();
 }
@@ -247,10 +261,9 @@ void HexagonTargetMachine::adjustPassManager(PassManagerBuilder &PMB) {
     });
 }
 
-TargetIRAnalysis HexagonTargetMachine::getTargetIRAnalysis() {
-  return TargetIRAnalysis([this](const Function &F) {
-    return TargetTransformInfo(HexagonTTIImpl(this, F));
-  });
+TargetTransformInfo
+HexagonTargetMachine::getTargetTransformInfo(const Function &F) {
+  return TargetTransformInfo(HexagonTTIImpl(this, F));
 }
 
 
@@ -289,8 +302,16 @@ void HexagonPassConfig::addIRPasses() {
   TargetPassConfig::addIRPasses();
   bool NoOpt = (getOptLevel() == CodeGenOpt::None);
 
-  addPass(createAtomicExpandPass());
   if (!NoOpt) {
+    addPass(createConstantPropagationPass());
+    addPass(createDeadCodeEliminationPass());
+  }
+
+  addPass(createAtomicExpandPass());
+
+  if (!NoOpt) {
+    if (EnableInitialCFGCleanup)
+      addPass(createCFGSimplificationPass(1, true, true, false, true));
     if (EnableLoopPrefetch)
       addPass(createLoopDataPrefetchPass());
     if (EnableCommGEP)
@@ -311,6 +332,8 @@ bool HexagonPassConfig::addInstSelector() {
   addPass(createHexagonISelDag(TM, getOptLevel()));
 
   if (!NoOpt) {
+    if (EnableVExtractOpt)
+      addPass(createHexagonVExtract());
     // Create logical operations on predicate registers.
     if (EnableGenPred)
       addPass(createHexagonGenPredicate());
@@ -340,6 +363,8 @@ bool HexagonPassConfig::addInstSelector() {
 
 void HexagonPassConfig::addPreRegAlloc() {
   if (getOptLevel() != CodeGenOpt::None) {
+    if (EnableCExtOpt)
+      addPass(createHexagonConstExtenders());
     if (EnableExpandCondsets)
       insertPass(&RegisterCoalescerID, &HexagonExpandCondsetsID);
     if (!DisableStoreWidening)
@@ -377,16 +402,17 @@ void HexagonPassConfig::addPreEmitPass() {
 
   addPass(createHexagonBranchRelaxation());
 
-  // Create Packets.
   if (!NoOpt) {
     if (!DisableHardwareLoops)
       addPass(createHexagonFixupHwLoops());
     // Generate MUX from pairs of conditional transfers.
     if (EnableGenMux)
       addPass(createHexagonGenMux());
-
-    addPass(createHexagonPacketizer(), false);
   }
+
+  // Packetization is mandatory: it handles gather/scatter at all opt levels.
+  addPass(createHexagonPacketizer(NoOpt), false);
+
   if (EnableVectorPrint)
     addPass(createHexagonVectorPrint(), false);
 

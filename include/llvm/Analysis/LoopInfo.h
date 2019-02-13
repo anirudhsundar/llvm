@@ -1,9 +1,8 @@
 //===- llvm/Analysis/LoopInfo.h - Natural Loop Calculator -------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -46,7 +45,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Allocator.h"
 #include <algorithm>
+#include <utility>
 
 namespace llvm {
 
@@ -74,25 +75,16 @@ template <class BlockT, class LoopT> class LoopBase {
 
   SmallPtrSet<const BlockT *, 8> DenseBlockSet;
 
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
   /// Indicator that this loop is no longer a valid loop.
   bool IsInvalid = false;
+#endif
 
   LoopBase(const LoopBase<BlockT, LoopT> &) = delete;
   const LoopBase<BlockT, LoopT> &
   operator=(const LoopBase<BlockT, LoopT> &) = delete;
 
-  void clear() {
-    IsInvalid = true;
-    SubLoops.clear();
-    Blocks.clear();
-    DenseBlockSet.clear();
-    ParentLoop = nullptr;
-  }
-
 public:
-  /// This creates an empty loop.
-  LoopBase() : ParentLoop(nullptr) {}
-
   /// Return the nesting level of this loop.  An outer-most loop has depth 1,
   /// for consistency with loop depth values used for basic blocks, where depth
   /// 0 is used for blocks not inside any loops.
@@ -153,11 +145,11 @@ public:
   bool empty() const { return getSubLoops().empty(); }
 
   /// Get a list of the basic blocks which make up this loop.
-  const std::vector<BlockT *> &getBlocks() const {
+  ArrayRef<BlockT *> getBlocks() const {
     assert(!isInvalid() && "Loop not in a valid state!");
     return Blocks;
   }
-  typedef typename std::vector<BlockT *>::const_iterator block_iterator;
+  typedef typename ArrayRef<BlockT *>::const_iterator block_iterator;
   block_iterator block_begin() const { return getBlocks().begin(); }
   block_iterator block_end() const { return getBlocks().end(); }
   inline iterator_range<block_iterator> blocks() const {
@@ -172,8 +164,38 @@ public:
     return Blocks.size();
   }
 
-  /// Return true if this loop is no longer valid.
-  bool isInvalid() const { return IsInvalid; }
+  /// Return a direct, mutable handle to the blocks vector so that we can
+  /// mutate it efficiently with techniques like `std::remove`.
+  std::vector<BlockT *> &getBlocksVector() {
+    assert(!isInvalid() && "Loop not in a valid state!");
+    return Blocks;
+  }
+  /// Return a direct, mutable handle to the blocks set so that we can
+  /// mutate it efficiently.
+  SmallPtrSetImpl<const BlockT *> &getBlocksSet() {
+    assert(!isInvalid() && "Loop not in a valid state!");
+    return DenseBlockSet;
+  }
+
+  /// Return a direct, immutable handle to the blocks set.
+  const SmallPtrSetImpl<const BlockT *> &getBlocksSet() const {
+    assert(!isInvalid() && "Loop not in a valid state!");
+    return DenseBlockSet;
+  }
+
+  /// Return true if this loop is no longer valid.  The only valid use of this
+  /// helper is "assert(L.isInvalid())" or equivalent, since IsInvalid is set to
+  /// true by the destructor.  In other words, if this accessor returns true,
+  /// the caller has already triggered UB by calling this accessor; and so it
+  /// can only be called in a context where a return value of true indicates a
+  /// programmer error.
+  bool isInvalid() const {
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    return IsInvalid;
+#else
+    return false;
+#endif
+  }
 
   /// True if terminator in the block can branch to another block that is
   /// outside of the current loop.
@@ -237,6 +259,20 @@ public:
   /// If getExitBlocks would return exactly one block, return that block.
   /// Otherwise return null.
   BlockT *getExitBlock() const;
+
+  /// Return true if no exit block for the loop has a predecessor that is
+  /// outside the loop.
+  bool hasDedicatedExits() const;
+
+  /// Return all unique successor blocks of this loop.
+  /// These are the blocks _outside of the current loop_ which are branched to.
+  /// This assumes that loop exits are in canonical form, i.e. all exits are
+  /// dedicated exits.
+  void getUniqueExitBlocks(SmallVectorImpl<BlockT *> &ExitBlocks) const;
+
+  /// If getUniqueExitBlocks would return exactly one block, return that block.
+  /// Otherwise return null.
+  BlockT *getUniqueExitBlock() const;
 
   /// Edge type.
   typedef std::pair<const BlockT *, const BlockT *> Edge;
@@ -310,6 +346,12 @@ public:
     return Child;
   }
 
+  /// This removes the specified child from being a subloop of this loop. The
+  /// loop is not deleted, as it will presumably be inserted into another loop.
+  LoopT *removeChildLoop(LoopT *Child) {
+    return removeChildLoop(llvm::find(*this, Child));
+  }
+
   /// This adds a basic block directly to the basic block list.
   /// This should only be used by transformations that create new loops.  Other
   /// transformations should use addBasicBlockToLoop.
@@ -365,11 +407,21 @@ public:
   /// Verify loop structure of this loop and all nested loops.
   void verifyLoopNest(DenseSet<const LoopT *> *Loops) const;
 
+  /// Returns true if the loop is annotated parallel.
+  ///
+  /// Derived classes can override this method using static template
+  /// polymorphism.
+  bool isAnnotatedParallel() const { return false; }
+
   /// Print loop with all the BBs inside it.
   void print(raw_ostream &OS, unsigned Depth = 0, bool Verbose = false) const;
 
 protected:
   friend class LoopInfoBase<BlockT, LoopT>;
+
+  /// This creates an empty loop.
+  LoopBase() : ParentLoop(nullptr) {}
+
   explicit LoopBase(BlockT *BB) : ParentLoop(nullptr) {
     Blocks.push_back(BB);
     DenseBlockSet.insert(BB);
@@ -386,7 +438,15 @@ protected:
   // non-public.
   ~LoopBase() {
     for (auto *SubLoop : SubLoops)
-      delete SubLoop;
+      SubLoop->~LoopT();
+
+#if LLVM_ENABLE_ABI_BREAKING_CHECKS
+    IsInvalid = true;
+#endif
+    SubLoops.clear();
+    Blocks.clear();
+    DenseBlockSet.clear();
+    ParentLoop = nullptr;
   }
 };
 
@@ -403,7 +463,7 @@ extern template class LoopBase<BasicBlock, Loop>;
 /// in the CFG are necessarily loops.
 class Loop : public LoopBase<BasicBlock, Loop> {
 public:
-  /// \brief A range representing the start and end location of a loop.
+  /// A range representing the start and end location of a loop.
   class LocRange {
     DebugLoc Start;
     DebugLoc End;
@@ -417,12 +477,10 @@ public:
     const DebugLoc &getStart() const { return Start; }
     const DebugLoc &getEnd() const { return End; }
 
-    /// \brief Check for null.
+    /// Check for null.
     ///
     explicit operator bool() const { return Start && End; }
   };
-
-  Loop() {}
 
   /// Return true if the specified value is loop invariant.
   bool isLoopInvariant(const Value *V) const;
@@ -494,7 +552,7 @@ public:
   ///
   /// If this loop contains the same llvm.loop metadata on each branch to the
   /// header then the node is returned. If any latch instruction does not
-  /// contain llvm.loop or or if multiple latches contain different nodes then
+  /// contain llvm.loop or if multiple latches contain different nodes then
   /// 0 is returned.
   MDNode *getLoopID() const;
   /// Set the llvm.loop loop id metadata for this loop.
@@ -506,19 +564,13 @@ public:
   /// operand should be the node itself.
   void setLoopID(MDNode *LoopID) const;
 
-  /// Return true if no exit block for the loop has a predecessor that is
-  /// outside the loop.
-  bool hasDedicatedExits() const;
-
-  /// Return all unique successor blocks of this loop.
-  /// These are the blocks _outside of the current loop_ which are branched to.
-  /// This assumes that loop exits are in canonical form, i.e. all exits are
-  /// dedicated exits.
-  void getUniqueExitBlocks(SmallVectorImpl<BasicBlock *> &ExitBlocks) const;
-
-  /// If getUniqueExitBlocks would return exactly one block, return that block.
-  /// Otherwise return null.
-  BasicBlock *getUniqueExitBlock() const;
+  /// Add llvm.loop.unroll.disable to this loop's loop id metadata.
+  ///
+  /// Remove existing unroll metadata and add unroll disable metadata to
+  /// indicate the loop has already been unrolled.  This prevents a loop
+  /// from being unrolled more than is directed by a pragma if the loop
+  /// unrolling pass is run more than once (which it generally is).
+  void setLoopAlreadyUnrolled();
 
   void dump() const;
   void dumpVerbose() const;
@@ -534,8 +586,6 @@ public:
   LocRange getLocRange() const;
 
   StringRef getName() const {
-    if (isInvalid())
-      return "<invalidated loop>";
     if (BasicBlock *Header = getHeader())
       if (Header->hasName())
         return Header->getName();
@@ -543,6 +593,8 @@ public:
   }
 
 private:
+  Loop() = default;
+
   friend class LoopInfoBase<BasicBlock, Loop>;
   friend class LoopBase<BasicBlock, Loop>;
   explicit Loop(BasicBlock *BB) : LoopBase<BasicBlock, Loop>(BB) {}
@@ -558,7 +610,7 @@ template <class BlockT, class LoopT> class LoopInfoBase {
   // BBMap - Mapping of basic blocks to the inner most loop they occur in
   DenseMap<const BlockT *, LoopT *> BBMap;
   std::vector<LoopT *> TopLevelLoops;
-  std::vector<LoopT *> RemovedLoops;
+  BumpPtrAllocator LoopAllocator;
 
   friend class LoopBase<BlockT, LoopT>;
   friend class LoopInfo;
@@ -572,7 +624,8 @@ public:
 
   LoopInfoBase(LoopInfoBase &&Arg)
       : BBMap(std::move(Arg.BBMap)),
-        TopLevelLoops(std::move(Arg.TopLevelLoops)) {
+        TopLevelLoops(std::move(Arg.TopLevelLoops)),
+        LoopAllocator(std::move(Arg.LoopAllocator)) {
     // We have to clear the arguments top level loops as we've taken ownership.
     Arg.TopLevelLoops.clear();
   }
@@ -580,8 +633,10 @@ public:
     BBMap = std::move(RHS.BBMap);
 
     for (auto *L : TopLevelLoops)
-      delete L;
+      L->~LoopT();
+
     TopLevelLoops = std::move(RHS.TopLevelLoops);
+    LoopAllocator = std::move(RHS.LoopAllocator);
     RHS.TopLevelLoops.clear();
     return *this;
   }
@@ -590,11 +645,14 @@ public:
     BBMap.clear();
 
     for (auto *L : TopLevelLoops)
-      delete L;
+      L->~LoopT();
     TopLevelLoops.clear();
-    for (auto *L : RemovedLoops)
-      delete L;
-    RemovedLoops.clear();
+    LoopAllocator.Reset();
+  }
+
+  template <typename... ArgsTy> LoopT *AllocateLoop(ArgsTy &&... Args) {
+    LoopT *Storage = LoopAllocator.Allocate<LoopT>();
+    return new (Storage) LoopT(std::forward<ArgsTy>(Args)...);
   }
 
   /// iterator/begin/end - The interface to the top-level loops in the current
@@ -716,8 +774,23 @@ public:
 
   void verify(const DominatorTreeBase<BlockT, false> &DomTree) const;
 
-protected:
-  static void clearLoop(LoopT &L) { L.clear(); }
+  /// Destroy a loop that has been removed from the `LoopInfo` nest.
+  ///
+  /// This runs the destructor of the loop object making it invalid to
+  /// reference afterward. The memory is retained so that the *pointer* to the
+  /// loop remains valid.
+  ///
+  /// The caller is responsible for removing this loop from the loop nest and
+  /// otherwise disconnecting it from the broader `LoopInfo` data structures.
+  /// Callers that don't naturally handle this themselves should probably call
+  /// `erase' instead.
+  void destroy(LoopT *L) {
+    L->~LoopT();
+
+    // Since LoopAllocator is a BumpPtrAllocator, this Deallocate only poisons
+    // \c L, but the pointer remains valid for non-dereferencing uses.
+    LoopAllocator.Deallocate(L);
+  }
 };
 
 // Implementation in LoopInfoImpl.h
@@ -867,7 +940,7 @@ template <> struct GraphTraits<Loop *> {
   static ChildIteratorType child_end(NodeRef N) { return N->end(); }
 };
 
-/// \brief Analysis pass that exposes the \c LoopInfo for a function.
+/// Analysis pass that exposes the \c LoopInfo for a function.
 class LoopAnalysis : public AnalysisInfoMixin<LoopAnalysis> {
   friend AnalysisInfoMixin<LoopAnalysis>;
   static AnalysisKey Key;
@@ -878,7 +951,7 @@ public:
   LoopInfo run(Function &F, FunctionAnalysisManager &AM);
 };
 
-/// \brief Printer pass for the \c LoopAnalysis results.
+/// Printer pass for the \c LoopAnalysis results.
 class LoopPrinterPass : public PassInfoMixin<LoopPrinterPass> {
   raw_ostream &OS;
 
@@ -887,12 +960,12 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
-/// \brief Verifier pass for the \c LoopAnalysis results.
+/// Verifier pass for the \c LoopAnalysis results.
 struct LoopVerifierPass : public PassInfoMixin<LoopVerifierPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
-/// \brief The legacy pass manager's analysis pass to compute loop information.
+/// The legacy pass manager's analysis pass to compute loop information.
 class LoopInfoWrapperPass : public FunctionPass {
   LoopInfo LI;
 
@@ -906,7 +979,7 @@ public:
   LoopInfo &getLoopInfo() { return LI; }
   const LoopInfo &getLoopInfo() const { return LI; }
 
-  /// \brief Calculate the natural loop information for a given function.
+  /// Calculate the natural loop information for a given function.
   bool runOnFunction(Function &F) override;
 
   void verifyAnalysis() const override;
@@ -920,6 +993,46 @@ public:
 
 /// Function to print a loop's contents as LLVM's text IR assembly.
 void printLoop(Loop &L, raw_ostream &OS, const std::string &Banner = "");
+
+/// Find and return the loop attribute node for the attribute @p Name in
+/// @p LoopID. Return nullptr if there is no such attribute.
+MDNode *findOptionMDForLoopID(MDNode *LoopID, StringRef Name);
+
+/// Find string metadata for a loop.
+///
+/// Returns the MDNode where the first operand is the metadata's name. The
+/// following operands are the metadata's values. If no metadata with @p Name is
+/// found, return nullptr.
+MDNode *findOptionMDForLoop(const Loop *TheLoop, StringRef Name);
+
+/// Return whether an MDNode might represent an access group.
+///
+/// Access group metadata nodes have to be distinct and empty. Being
+/// always-empty ensures that it never needs to be changed (which -- because
+/// MDNodes are designed immutable -- would require creating a new MDNode). Note
+/// that this is not a sufficient condition: not every distinct and empty NDNode
+/// is representing an access group.
+bool isValidAsAccessGroup(MDNode *AccGroup);
+
+/// Create a new LoopID after the loop has been transformed.
+///
+/// This can be used when no follow-up loop attributes are defined
+/// (llvm::makeFollowupLoopID returning None) to stop transformations to be
+/// applied again.
+///
+/// @param Context        The LLVMContext in which to create the new LoopID.
+/// @param OrigLoopID     The original LoopID; can be nullptr if the original
+///                       loop has no LoopID.
+/// @param RemovePrefixes Remove all loop attributes that have these prefixes.
+///                       Use to remove metadata of the transformation that has
+///                       been applied.
+/// @param AddAttrs       Add these loop attributes to the new LoopID.
+///
+/// @return A new LoopID that can be applied using Loop::setLoopID().
+llvm::MDNode *
+makePostTransformationMetadata(llvm::LLVMContext &Context, MDNode *OrigLoopID,
+                               llvm::ArrayRef<llvm::StringRef> RemovePrefixes,
+                               llvm::ArrayRef<llvm::MDNode *> AddAttrs);
 
 } // End llvm namespace
 

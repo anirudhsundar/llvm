@@ -1,9 +1,8 @@
 //===-- llvm-dwarfdump.cpp - Debug info dumping utility for llvm ----------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,28 +11,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/DebugInfo/DIContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/MachOUniversal.h"
 #include "llvm/Object/ObjectFile.h"
-#include "llvm/Object/RelocVisitor.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
-#include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/PrettyStackTrace.h"
-#include "llvm/Support/Signals.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
-#include <algorithm>
-#include <cstring>
-#include <string>
-#include <system_error>
 
 using namespace llvm;
 using namespace object;
@@ -134,49 +129,94 @@ static list<std::string>
                      "name or by number. This option can be specified "
                      "multiple times, once for each desired architecture."),
                 cat(DwarfDumpCategory));
-static opt<bool> DumpUUID("uuid", desc("Show the UUID for each architecture"),
-                          cat(DwarfDumpCategory));
-static alias DumpUUIDAlias("u", desc("Alias for -uuid"), aliasopt(DumpUUID));
+static opt<bool>
+    Diff("diff",
+         desc("Emit diff-friendly output by omitting offsets and addresses."),
+         cat(DwarfDumpCategory));
+static list<std::string>
+    Find("find",
+         desc("Search for the exact match for <name> in the accelerator tables "
+              "and print the matching debug information entries. When no "
+              "accelerator tables are available, the slower but more complete "
+              "-name option can be used instead."),
+         value_desc("name"), cat(DwarfDumpCategory));
+static alias FindAlias("f", desc("Alias for -find."), aliasopt(Find));
+static opt<bool>
+    IgnoreCase("ignore-case",
+               desc("Ignore case distinctions in when searching by name."),
+               value_desc("i"), cat(DwarfDumpCategory));
+static alias IgnoreCaseAlias("i", desc("Alias for -ignore-case."),
+                             aliasopt(IgnoreCase));
+static list<std::string> Name(
+    "name",
+    desc("Find and print all debug info entries whose name (DW_AT_name "
+         "attribute) matches the exact text in <pattern>.  When used with the "
+         "the -regex option <pattern> is interpreted as a regular expression."),
+    value_desc("pattern"), cat(DwarfDumpCategory));
+static alias NameAlias("n", desc("Alias for -name"), aliasopt(Name));
+static opt<unsigned long long> Lookup("lookup",
+           desc("Lookup <address> in the debug information and print out any "
+                "available file, function, block and line table details."),
+           value_desc("address"), cat(DwarfDumpCategory));
 static opt<std::string>
     OutputFilename("out-file", cl::init(""),
-                   cl::desc("Redirect output to the specified file"),
+                   cl::desc("Redirect output to the specified file."),
                    cl::value_desc("filename"));
-static alias OutputFilenameAlias("o", desc("Alias for -out-file"),
+static alias OutputFilenameAlias("o", desc("Alias for -out-file."),
                                  aliasopt(OutputFilename),
                                  cat(DwarfDumpCategory));
 static opt<bool>
+    UseRegex("regex",
+             desc("Treat any <pattern> strings as regular expressions when "
+                  "searching instead of just as an exact string match."),
+             cat(DwarfDumpCategory));
+static alias RegexAlias("x", desc("Alias for -regex"), aliasopt(UseRegex));
+static opt<bool>
     ShowChildren("show-children",
                  desc("Show a debug info entry's children when selectively "
-                      "printing with the =<offset> option"),
+                      "printing with the =<offset> option."),
                  cat(DwarfDumpCategory));
-static alias ShowChildrenAlias("c", desc("Alias for -show-children"),
+static alias ShowChildrenAlias("c", desc("Alias for -show-children."),
                                aliasopt(ShowChildren));
 static opt<bool>
     ShowParents("show-parents",
                 desc("Show a debug info entry's parents when selectively "
-                     "printing with the =<offset> option"),
+                     "printing with the =<offset> option."),
                 cat(DwarfDumpCategory));
-static alias ShowParentsAlias("p", desc("Alias for -show-parents"),
+static alias ShowParentsAlias("p", desc("Alias for -show-parents."),
                               aliasopt(ShowParents));
+static opt<bool>
+    ShowForm("show-form",
+             desc("Show DWARF form types after the DWARF attribute types."),
+             cat(DwarfDumpCategory));
+static alias ShowFormAlias("F", desc("Alias for -show-form."),
+                           aliasopt(ShowForm), cat(DwarfDumpCategory));
 static opt<unsigned> RecurseDepth(
     "recurse-depth",
     desc("Only recurse to a depth of N when displaying debug info entries."),
     cat(DwarfDumpCategory), init(-1U), value_desc("N"));
-static alias RecurseDepthAlias("r", desc("Alias for -recurse-depth"),
+static alias RecurseDepthAlias("r", desc("Alias for -recurse-depth."),
                                aliasopt(RecurseDepth));
 
 static opt<bool>
     SummarizeTypes("summarize-types",
-                   desc("Abbreviate the description of type unit entries"),
+                   desc("Abbreviate the description of type unit entries."),
                    cat(DwarfDumpCategory));
-static opt<bool> Verify("verify", desc("Verify the DWARF debug info"),
+static cl::opt<bool>
+    Statistics("statistics",
+               cl::desc("Emit JSON-formatted debug info quality metrics."),
+               cat(DwarfDumpCategory));
+static opt<bool> Verify("verify", desc("Verify the DWARF debug info."),
                         cat(DwarfDumpCategory));
 static opt<bool> Quiet("quiet", desc("Use with -verify to not emit to STDOUT."),
                        cat(DwarfDumpCategory));
+static opt<bool> DumpUUID("uuid", desc("Show the UUID for each architecture."),
+                          cat(DwarfDumpCategory));
+static alias DumpUUIDAlias("u", desc("Alias for -uuid."), aliasopt(DumpUUID));
 static opt<bool> Verbose("verbose",
-                         desc("Print more low-level encoding details"),
+                         desc("Print more low-level encoding details."),
                          cat(DwarfDumpCategory));
-static alias VerboseAlias("v", desc("Alias for -verbose"), aliasopt(Verbose),
+static alias VerboseAlias("v", desc("Alias for -verbose."), aliasopt(Verbose),
                           cat(DwarfDumpCategory));
 } // namespace
 /// @}
@@ -185,7 +225,7 @@ static alias VerboseAlias("v", desc("Alias for -verbose"), aliasopt(Verbose),
 static void error(StringRef Prefix, std::error_code EC) {
   if (!EC)
     return;
-  errs() << Prefix << ": " << EC.message() << "\n";
+  WithColor::error() << Prefix << ": " << EC.message() << "\n";
   exit(1);
 }
 
@@ -193,8 +233,10 @@ static DIDumpOptions getDumpOpts() {
   DIDumpOptions DumpOpts;
   DumpOpts.DumpType = DumpType;
   DumpOpts.RecurseDepth = RecurseDepth;
+  DumpOpts.ShowAddresses = !Diff;
   DumpOpts.ShowChildren = ShowChildren;
   DumpOpts.ShowParents = ShowParents;
+  DumpOpts.ShowForm = ShowForm;
   DumpOpts.SummarizeTypes = SummarizeTypes;
   DumpOpts.Verbose = Verbose;
   // In -verify mode, print DIEs without children in error messages.
@@ -214,12 +256,17 @@ static uint32_t getCPUType(MachOObjectFile &MachO) {
 static bool filterArch(ObjectFile &Obj) {
   if (ArchFilters.empty())
     return true;
+
   if (auto *MachO = dyn_cast<MachOObjectFile>(&Obj)) {
     std::string ObjArch =
         Triple::getArchTypeName(MachO->getArchTriple().getArch());
+
     for (auto Arch : ArchFilters) {
+      // Match name.
       if (Arch == ObjArch)
         return true;
+
+      // Match architecture number.
       unsigned Value;
       if (!StringRef(Arch).getAsInteger(0, Value))
         if (Value == getCPUType(*MachO))
@@ -232,6 +279,130 @@ static bool filterArch(ObjectFile &Obj) {
 using HandlerFn = std::function<bool(ObjectFile &, DWARFContext &DICtx, Twine,
                                      raw_ostream &)>;
 
+/// Print only DIEs that have a certain name.
+static bool filterByName(const StringSet<> &Names, DWARFDie Die,
+                         StringRef NameRef, raw_ostream &OS) {
+  std::string Name =
+      (IgnoreCase && !UseRegex) ? NameRef.lower() : NameRef.str();
+  if (UseRegex) {
+    // Match regular expression.
+    for (auto Pattern : Names.keys()) {
+      Regex RE(Pattern, IgnoreCase ? Regex::IgnoreCase : Regex::NoFlags);
+      std::string Error;
+      if (!RE.isValid(Error)) {
+        errs() << "error in regular expression: " << Error << "\n";
+        exit(1);
+      }
+      if (RE.match(Name)) {
+        Die.dump(OS, 0, getDumpOpts());
+        return true;
+      }
+    }
+  } else if (Names.count(Name)) {
+    // Match full text.
+    Die.dump(OS, 0, getDumpOpts());
+    return true;
+  }
+  return false;
+}
+
+/// Print only DIEs that have a certain name.
+static void filterByName(const StringSet<> &Names,
+                         DWARFContext::unit_iterator_range CUs,
+                         raw_ostream &OS) {
+  for (const auto &CU : CUs)
+    for (const auto &Entry : CU->dies()) {
+      DWARFDie Die = {CU.get(), &Entry};
+      if (const char *Name = Die.getName(DINameKind::ShortName))
+        if (filterByName(Names, Die, Name, OS))
+          continue;
+      if (const char *Name = Die.getName(DINameKind::LinkageName))
+        filterByName(Names, Die, Name, OS);
+    }
+}
+
+static void getDies(DWARFContext &DICtx, const AppleAcceleratorTable &Accel,
+                    StringRef Name, SmallVectorImpl<DWARFDie> &Dies) {
+  for (const auto &Entry : Accel.equal_range(Name)) {
+    if (llvm::Optional<uint64_t> Off = Entry.getDIESectionOffset()) {
+      if (DWARFDie Die = DICtx.getDIEForOffset(*Off))
+        Dies.push_back(Die);
+    }
+  }
+}
+
+static DWARFDie toDie(const DWARFDebugNames::Entry &Entry,
+                      DWARFContext &DICtx) {
+  llvm::Optional<uint64_t> CUOff = Entry.getCUOffset();
+  llvm::Optional<uint64_t> Off = Entry.getDIEUnitOffset();
+  if (!CUOff || !Off)
+    return DWARFDie();
+
+  DWARFCompileUnit *CU = DICtx.getCompileUnitForOffset(*CUOff);
+  if (!CU)
+    return DWARFDie();
+
+  if (llvm::Optional<uint64_t> DWOId = CU->getDWOId()) {
+    // This is a skeleton unit. Look up the DIE in the DWO unit.
+    CU = DICtx.getDWOCompileUnitForHash(*DWOId);
+    if (!CU)
+      return DWARFDie();
+  }
+
+  return CU->getDIEForOffset(CU->getOffset() + *Off);
+}
+
+static void getDies(DWARFContext &DICtx, const DWARFDebugNames &Accel,
+                    StringRef Name, SmallVectorImpl<DWARFDie> &Dies) {
+  for (const auto &Entry : Accel.equal_range(Name)) {
+    if (DWARFDie Die = toDie(Entry, DICtx))
+      Dies.push_back(Die);
+  }
+}
+
+/// Print only DIEs that have a certain name.
+static void filterByAccelName(ArrayRef<std::string> Names, DWARFContext &DICtx,
+                              raw_ostream &OS) {
+  SmallVector<DWARFDie, 4> Dies;
+  for (const auto &Name : Names) {
+    getDies(DICtx, DICtx.getAppleNames(), Name, Dies);
+    getDies(DICtx, DICtx.getAppleTypes(), Name, Dies);
+    getDies(DICtx, DICtx.getAppleNamespaces(), Name, Dies);
+    getDies(DICtx, DICtx.getDebugNames(), Name, Dies);
+  }
+  llvm::sort(Dies);
+  Dies.erase(std::unique(Dies.begin(), Dies.end()), Dies.end());
+
+  for (DWARFDie Die : Dies)
+    Die.dump(OS, 0, getDumpOpts());
+}
+
+/// Handle the --lookup option and dump the DIEs and line info for the given
+/// address.
+static bool lookup(DWARFContext &DICtx, uint64_t Address, raw_ostream &OS) {
+  auto DIEsForAddr = DICtx.getDIEsForAddress(Lookup);
+
+  if (!DIEsForAddr)
+    return false;
+
+  DIDumpOptions DumpOpts = getDumpOpts();
+  DumpOpts.RecurseDepth = 0;
+  DIEsForAddr.CompileUnit->dump(OS, DumpOpts);
+  if (DIEsForAddr.FunctionDIE) {
+    DIEsForAddr.FunctionDIE.dump(OS, 2, DumpOpts);
+    if (DIEsForAddr.BlockDIE)
+      DIEsForAddr.BlockDIE.dump(OS, 4, DumpOpts);
+  }
+
+  if (DILineInfo LineInfo = DICtx.getLineInfoForAddress(Lookup))
+    LineInfo.dump(OS);
+
+  return true;
+}
+
+bool collectStatsForObjectFile(ObjectFile &Obj, DWARFContext &DICtx,
+                               Twine Filename, raw_ostream &OS);
+
 static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx, Twine Filename,
                            raw_ostream &OS) {
   logAllUnhandledErrors(DICtx.loadRegisterInfo(Obj), errs(),
@@ -239,6 +410,27 @@ static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx, Twine Filename,
   // The UUID dump already contains all the same information.
   if (!(DumpType & DIDT_UUID) || DumpType == DIDT_All)
     OS << Filename << ":\tfile format " << Obj.getFileFormatName() << '\n';
+
+  // Handle the --lookup option.
+  if (Lookup)
+    return lookup(DICtx, Lookup, OS);
+
+  // Handle the --name option.
+  if (!Name.empty()) {
+    StringSet<> Names;
+    for (auto name : Name)
+      Names.insert((IgnoreCase && !UseRegex) ? StringRef(name).lower() : name);
+
+    filterByName(Names, DICtx.normal_units(), OS);
+    filterByName(Names, DICtx.dwo_units(), OS);
+    return true;
+  }
+
+  // Handle the --find option and lower it to --debug-info=<offset>.
+  if (!Find.empty()) {
+    filterByAccelName(Find, DICtx, OS);
+    return true;
+  }
 
   // Dump the complete DWARF structure.
   DICtx.dump(OS, getDumpOpts(), DumpOffsets);
@@ -332,6 +524,8 @@ static bool handleFile(StringRef Filename, HandlerFn HandleObj,
 static std::vector<std::string> expandBundle(const std::string &InputPath) {
   std::vector<std::string> BundlePaths;
   SmallString<256> BundlePath(InputPath);
+  // Normalize input path. This is necessary to accept `bundle.dSYM/`.
+  sys::path::remove_dots(BundlePath);
   // Manually open up the bundle to avoid introducing additional dependencies.
   if (sys::fs::is_directory(BundlePath) &&
       sys::path::extension(BundlePath) == ".dSYM") {
@@ -360,15 +554,12 @@ static std::vector<std::string> expandBundle(const std::string &InputPath) {
 }
 
 int main(int argc, char **argv) {
-  // Print a stack trace if we signal out.
-  sys::PrintStackTraceOnErrorSignal(argv[0]);
-  PrettyStackTraceProgram X(argc, argv);
-  llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
+  InitLLVM X(argc, argv);
 
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargetMCs();
 
-  HideUnrelatedOptions({&DwarfDumpCategory, &SectionCategory});
+  HideUnrelatedOptions({&DwarfDumpCategory, &SectionCategory, &ColorCategory});
   cl::ParseCommandLineOptions(
       argc, argv,
       "pretty-print DWARF debug information in object files"
@@ -376,6 +567,14 @@ int main(int argc, char **argv) {
 
   if (Help) {
     PrintHelpMessage(/*Hidden =*/false, /*Categorized =*/true);
+    return 0;
+  }
+
+  // FIXME: Audit interactions between these two options and make them
+  //        compatible.
+  if (Diff && Verbose) {
+    WithColor::error() << "incompatible arguments: specifying both -diff and "
+                          "-verbose is currently not supported";
     return 0;
   }
 
@@ -390,14 +589,17 @@ int main(int argc, char **argv) {
   }
 
   raw_ostream &OS = OutputFile ? OutputFile->os() : outs();
+  bool OffsetRequested = false;
 
   // Defaults to dumping all sections, unless brief mode is specified in which
   // case only the .debug_info section in dumped.
 #define HANDLE_DWARF_SECTION(ENUM_NAME, ELF_NAME, CMDLINE_NAME)                \
   if (Dump##ENUM_NAME.IsRequested) {                                           \
     DumpType |= DIDT_##ENUM_NAME;                                              \
-    if (Dump##ENUM_NAME.HasValue)                                              \
+    if (Dump##ENUM_NAME.HasValue) {                                            \
       DumpOffsets[DIDT_ID_##ENUM_NAME] = Dump##ENUM_NAME.Val;                  \
+      OffsetRequested = true;                                                  \
+    }                                                                          \
   }
 #include "llvm/BinaryFormat/Dwarf.def"
 #undef HANDLE_DWARF_SECTION
@@ -412,8 +614,12 @@ int main(int argc, char **argv) {
       DumpType = DIDT_DebugInfo;
   }
 
+  // Unless dumping a specific DIE, default to --show-children.
+  if (!ShowChildren && !Verify && !OffsetRequested && Name.empty() && Find.empty())
+    ShowChildren = true;
+
   // Defaults to a.out if no filenames specified.
-  if (InputFilenames.size() == 0)
+  if (InputFilenames.empty())
     InputFilenames.push_back("a.out");
 
   // Expand any .dSYM bundles to the individual object files contained therein.
@@ -425,11 +631,14 @@ int main(int argc, char **argv) {
 
   if (Verify) {
     // If we encountered errors during verify, exit with a non-zero exit status.
-    if (!std::all_of(Objects.begin(), Objects.end(), [&](std::string Object) {
+    if (!all_of(Objects, [&](std::string Object) {
           return handleFile(Object, verifyObjectFile, OS);
         }))
       exit(1);
-  } else
+  } else if (Statistics)
+    for (auto Object : Objects)
+      handleFile(Object, collectStatsForObjectFile, OS);
+  else
     for (auto Object : Objects)
       handleFile(Object, dumpObjectFile, OS);
 

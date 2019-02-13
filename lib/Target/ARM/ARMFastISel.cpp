@@ -1,9 +1,8 @@
 //===- ARMFastISel.cpp - ARM FastISel implementation ----------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -41,8 +40,11 @@
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/MachineValueType.h"
 #include "llvm/CodeGen/RuntimeLibcalls.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetLowering.h"
+#include "llvm/CodeGen/TargetOpcodes.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/ValueTypes.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
@@ -71,13 +73,10 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MachineValueType.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Target/TargetLowering.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOpcodes.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/Target/TargetRegisterInfo.h"
 #include <cassert>
 #include <cstdint>
 #include <utility>
@@ -244,8 +243,6 @@ class ARMFastISel final : public FastISel {
 };
 
 } // end anonymous namespace
-
-#include "ARMGenCallingConv.inc"
 
 // DefinesOptionalPredicate - This is different from DefinesPredicate in that
 // we don't care about implicit defs here, just places we'll need to add a
@@ -500,7 +497,7 @@ unsigned ARMFastISel::ARMMaterializeInt(const Constant *C, MVT VT) {
   }
 
   unsigned ResultReg = 0;
-  if (Subtarget->useMovt(*FuncInfo.MF))
+  if (Subtarget->useMovt())
     ResultReg = fastEmit_i(VT, VT, ISD::Constant, CI->getZExtValue());
 
   if (ResultReg)
@@ -558,7 +555,7 @@ unsigned ARMFastISel::ARMMaterializeGV(const GlobalValue *GV, MVT VT) {
   bool IsPositionIndependent = isPositionIndependent();
   // Use movw+movt when possible, it avoids constant pool entries.
   // Non-darwin targets only support static movt relocations in FastISel.
-  if (Subtarget->useMovt(*FuncInfo.MF) &&
+  if (Subtarget->useMovt() &&
       (Subtarget->isTargetMachO() || !IsPositionIndependent)) {
     unsigned Opc;
     unsigned char TF = 0;
@@ -1416,7 +1413,7 @@ bool ARMFastISel::ARMEmitCmp(const Value *Src1Value, const Value *Src2Value,
     case MVT::i8:
     case MVT::i16:
       needsExt = true;
-    // Intentional fall-through.
+      LLVM_FALLTHROUGH;
     case MVT::i32:
       if (isThumb2) {
         if (!UseImm)
@@ -2116,7 +2113,7 @@ bool ARMFastISel::SelectRet(const Instruction *I) {
   CallingConv::ID CC = F.getCallingConv();
   if (Ret->getNumOperands() > 0) {
     SmallVector<ISD::OutputArg, 4> Outs;
-    GetReturnInfo(F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
+    GetReturnInfo(CC, F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
 
     // Analyze operands of the call, assigning locations to each operand.
     SmallVector<CCValAssign, 16> ValLocs;
@@ -2352,8 +2349,8 @@ bool ARMFastISel::SelectCall(const Instruction *I,
   for (ImmutableCallSite::arg_iterator i = CS.arg_begin(), e = CS.arg_end();
        i != e; ++i) {
     // If we're lowering a memory intrinsic instead of a regular call, skip the
-    // last two arguments, which shouldn't be passed to the underlying function.
-    if (IntrMemName && e-i <= 2)
+    // last argument, which shouldn't be passed to the underlying function.
+    if (IntrMemName && e - i <= 1)
       break;
 
     ISD::ArgFlagsTy Flags;
@@ -2546,7 +2543,8 @@ bool ARMFastISel::SelectIntrinsicCall(const IntrinsicInst &I) {
         if (!ARMComputeAddress(MTI.getRawDest(), Dest) ||
             !ARMComputeAddress(MTI.getRawSource(), Src))
           return false;
-        unsigned Alignment = MTI.getAlignment();
+        unsigned Alignment = MinAlign(MTI.getDestAlignment(),
+                                      MTI.getSourceAlignment());
         if (ARMTryEmitSmallMemCpy(Dest, Src, Len, Alignment))
           return true;
       }
@@ -2912,7 +2910,7 @@ static const struct FoldableLoadExtendsStruct {
   { { ARM::UXTB,  ARM::t2UXTB  },   0, 1, MVT::i8  }
 };
 
-/// \brief The specified machine instr operand is a vreg, and that
+/// The specified machine instr operand is a vreg, and that
 /// vreg is being provided by the specified load instruction.  If possible,
 /// try to fold the load as an operand to the instruction, returning true if
 /// successful.
@@ -2950,7 +2948,8 @@ bool ARMFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
   unsigned ResultReg = MI->getOperand(0).getReg();
   if (!ARMEmitLoad(VT, ResultReg, Addr, LI->getAlignment(), isZExt, false))
     return false;
-  MI->eraseFromParent();
+  MachineBasicBlock::iterator I(MI);
+  removeDeadCode(I, std::next(I));
   return true;
 }
 
@@ -2958,7 +2957,7 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
                                      unsigned Align, MVT VT) {
   bool UseGOT_PREL = !TM.shouldAssumeDSOLocal(*GV->getParent(), GV);
 
-  LLVMContext *Context = &MF->getFunction()->getContext();
+  LLVMContext *Context = &MF->getFunction().getContext();
   unsigned ARMPCLabelIndex = AFI->createPICLabelUId();
   unsigned PCAdj = Subtarget->isThumb() ? 4 : 8;
   ARMConstantPoolValue *CPV = ARMConstantPoolConstant::Create(
@@ -2969,12 +2968,16 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
   unsigned ConstAlign =
       MF->getDataLayout().getPrefTypeAlignment(Type::getInt32PtrTy(*Context));
   unsigned Idx = MF->getConstantPool()->getConstantPoolIndex(CPV, ConstAlign);
+  MachineMemOperand *CPMMO =
+      MF->getMachineMemOperand(MachinePointerInfo::getConstantPool(*MF),
+                               MachineMemOperand::MOLoad, 4, 4);
 
   unsigned TempReg = MF->getRegInfo().createVirtualRegister(&ARM::rGPRRegClass);
   unsigned Opc = isThumb2 ? ARM::t2LDRpci : ARM::LDRcp;
   MachineInstrBuilder MIB =
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), TempReg)
-          .addConstantPoolIndex(Idx);
+          .addConstantPoolIndex(Idx)
+          .addMemOperand(CPMMO);
   if (Opc == ARM::LDRcp)
     MIB.addImm(0);
   MIB.add(predOps(ARMCC::AL));
@@ -2987,6 +2990,7 @@ unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
   MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), DestReg)
             .addReg(TempReg)
             .addImm(ARMPCLabelIndex);
+
   if (!Subtarget->isThumb())
     MIB.add(predOps(ARMCC::AL));
 

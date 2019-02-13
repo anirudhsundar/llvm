@@ -1,9 +1,8 @@
 //===- TargetTransformInfoImpl.h --------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -27,7 +26,7 @@
 
 namespace llvm {
 
-/// \brief Base class for use as a mix-in that aids implementing
+/// Base class for use as a mix-in that aids implementing
 /// a TargetTransformInfo-compatible class.
 class TargetTransformInfoImplBase {
 protected:
@@ -152,10 +151,15 @@ public:
 
     case Intrinsic::annotation:
     case Intrinsic::assume:
+    case Intrinsic::sideeffect:
     case Intrinsic::dbg_declare:
     case Intrinsic::dbg_value:
+    case Intrinsic::dbg_label:
     case Intrinsic::invariant_start:
     case Intrinsic::invariant_end:
+    case Intrinsic::launder_invariant_group:
+    case Intrinsic::strip_invariant_group:
+    case Intrinsic::is_constant:
     case Intrinsic::lifetime_start:
     case Intrinsic::lifetime_end:
     case Intrinsic::objectsize:
@@ -188,6 +192,8 @@ public:
   }
 
   bool isLoweredToCall(const Function *F) {
+    assert(F && "A concrete function must be provided to this routine.");
+
     // FIXME: These should almost certainly not be handled here, and instead
     // handled with the help of TLI or the target itself. This was largely
     // ported from existing analysis heuristics here so that such refactorings
@@ -243,6 +249,12 @@ public:
                     C2.ScaleCost, C2.ImmCost, C2.SetupCost);
   }
 
+  bool canMacroFuseCmp() { return false; }
+
+  bool shouldFavorPostInc() const { return false; }
+
+  bool shouldFavorBackedgeIndex(const Loop *L) const { return false; }
+
   bool isLegalMaskedStore(Type *DataType) { return false; }
 
   bool isLegalMaskedLoad(Type *DataType) { return false; }
@@ -252,6 +264,8 @@ public:
   bool isLegalMaskedGather(Type *DataType) { return false; }
 
   bool hasDivRemOp(Type *DataType, bool IsSigned) { return false; }
+
+  bool hasVolatileVariant(Instruction *I, unsigned AddrSpace) { return false; }
 
   bool prefersVectorizedAddressing() { return true; }
 
@@ -270,6 +284,8 @@ public:
 
   bool isProfitableToHoist(Instruction *I) { return true; }
 
+  bool useAA() { return false; }
+
   bool isTypeLegal(Type *Ty) { return false; }
 
   unsigned getJumpBufAlignment() { return 0; }
@@ -278,6 +294,8 @@ public:
 
   bool shouldBuildLookupTables() { return true; }
   bool shouldBuildLookupTablesForConstant(Constant *C) { return true; }
+
+  bool useColdCCForColdCall(Function &F) { return false; }
 
   unsigned getScalarizationOverhead(Type *Ty, bool Insert, bool Extract) {
     return 0;
@@ -290,9 +308,14 @@ public:
 
   bool enableAggressiveInterleaving(bool LoopHasReductions) { return false; }
 
-  bool enableMemCmpExpansion(unsigned &MaxLoadSize) { return false; }
+  const TTI::MemCmpExpansionOptions *enableMemCmpExpansion(
+      bool IsZeroCmp) const {
+    return nullptr;
+  }
 
   bool enableInterleavedAccessVectorization() { return false; }
+
+  bool enableMaskedInterleavedAccessVectorization() { return false; }
 
   bool isFPVectorizationPotentiallyUnsafe() { return false; }
 
@@ -307,6 +330,8 @@ public:
   }
 
   bool haveFastSqrt(Type *Ty) { return false; }
+
+  bool isFCmpOrdCheaperThanFCmpZero(Type *Ty) { return true; }
 
   unsigned getFPOpCost(Type *Ty) { return TargetTransformInfo::TCC_Basic; }
 
@@ -332,6 +357,10 @@ public:
   unsigned getRegisterBitWidth(bool Vector) const { return 32; }
 
   unsigned getMinVectorRegisterBitWidth() { return 128; }
+
+  bool shouldMaximizeVectorBandwidth(bool OptSize) const { return false; }
+
+  unsigned getMinimumVF(unsigned ElemWidth) const { return 0; }
 
   bool
   shouldConsiderAddressTypePromotion(const Instruction &I,
@@ -425,8 +454,9 @@ public:
   unsigned getInterleavedMemoryOpCost(unsigned Opcode, Type *VecTy,
                                       unsigned Factor,
                                       ArrayRef<unsigned> Indices,
-                                      unsigned Alignment,
-                                      unsigned AddressSpace) {
+                                      unsigned Alignment, unsigned AddressSpace,
+                                      bool UseMaskForCond = false,
+                                      bool UseMaskForGaps = false) {
     return 1;
   }
 
@@ -495,6 +525,24 @@ public:
             Callee->getFnAttribute("target-cpu")) &&
            (Caller->getFnAttribute("target-features") ==
             Callee->getFnAttribute("target-features"));
+  }
+
+  bool areFunctionArgsABICompatible(const Function *Caller, const Function *Callee,
+                                    SmallPtrSetImpl<Argument *> &Args) const {
+    return (Caller->getFnAttribute("target-cpu") ==
+            Callee->getFnAttribute("target-cpu")) &&
+           (Caller->getFnAttribute("target-features") ==
+            Callee->getFnAttribute("target-features"));
+  }
+
+  bool isIndexedLoadLegal(TTI::MemIndexedMode Mode, Type *Ty,
+                          const DataLayout &DL) const {
+    return false;
+  }
+
+  bool isIndexedStoreLegal(TTI::MemIndexedMode Mode, Type *Ty,
+                           const DataLayout &DL) const {
+    return false;
   }
 
   unsigned getLoadStoreVecRegBitWidth(unsigned AddrSpace) const { return 128; }
@@ -619,7 +667,7 @@ protected:
   }
 };
 
-/// \brief CRTP base class for use as a mix-in that aids implementing
+/// CRTP base class for use as a mix-in that aids implementing
 /// a TargetTransformInfo-compatible class.
 template <typename T>
 class TargetTransformInfoImplCRTPBase : public TargetTransformInfoImplBase {
@@ -674,7 +722,9 @@ public:
       BaseGV = dyn_cast<GlobalValue>(Ptr->stripPointerCasts());
     }
     bool HasBaseReg = (BaseGV == nullptr);
-    int64_t BaseOffset = 0;
+
+    auto PtrSizeBits = DL.getPointerTypeSizeInBits(Ptr->getType());
+    APInt BaseOffset(PtrSizeBits, 0);
     int64_t Scale = 0;
 
     auto GTI = gep_type_begin(PointeeType, Operands);
@@ -700,9 +750,10 @@ public:
         BaseOffset += DL.getStructLayout(STy)->getElementOffset(Field);
       } else {
         int64_t ElementSize = DL.getTypeAllocSize(GTI.getIndexedType());
-        if (ConstIdx)
-          BaseOffset += ConstIdx->getSExtValue() * ElementSize;
-        else {
+        if (ConstIdx) {
+          BaseOffset +=
+              ConstIdx->getValue().sextOrTrunc(PtrSizeBits) * ElementSize;
+        } else {
           // Needs scale register.
           if (Scale != 0)
             // No addressing mode takes two scale registers.
@@ -715,9 +766,10 @@ public:
     // Assumes the address space is 0 when Ptr is nullptr.
     unsigned AS =
         (Ptr == nullptr ? 0 : Ptr->getType()->getPointerAddressSpace());
+
     if (static_cast<T *>(this)->isLegalAddressingMode(
-            TargetType, const_cast<GlobalValue *>(BaseGV), BaseOffset,
-            HasBaseReg, Scale, AS))
+            TargetType, const_cast<GlobalValue *>(BaseGV),
+            BaseOffset.sextOrTrunc(64).getSExtValue(), HasBaseReg, Scale, AS))
       return TTI::TCC_Free;
     return TTI::TCC_Basic;
   }
@@ -794,7 +846,7 @@ public:
     // A real function call is much slower.
     if (auto *CI = dyn_cast<CallInst>(I)) {
       const Function *F = CI->getCalledFunction();
-      if (static_cast<T *>(this)->isLoweredToCall(F))
+      if (!F || static_cast<T *>(this)->isLoweredToCall(F))
         return 40;
       // Some intrinsics return a value and a flag, we use the value type
       // to decide its latency.

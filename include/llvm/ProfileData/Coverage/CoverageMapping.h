@@ -1,9 +1,8 @@
 //===- CoverageMapping.h - Code coverage mapping support --------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -17,6 +16,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/None.h"
 #include "llvm/ADT/StringRef.h"
@@ -206,7 +206,7 @@ struct CounterMappingRegion {
     /// A CodeRegion associates some code with a counter
     CodeRegion,
 
-    /// An ExpansionRegion represents a file expansion region that associates 
+    /// An ExpansionRegion represents a file expansion region that associates
     /// a source range with the expansion of a virtual source file, such as
     /// for a macro instantiation or #include file.
     ExpansionRegion,
@@ -506,10 +506,9 @@ public:
 /// This is the main interface to get coverage information, using a profile to
 /// fill out execution counts.
 class CoverageMapping {
-  StringSet<> FunctionNames;
+  DenseMap<size_t, DenseSet<size_t>> RecordProvenance;
   std::vector<FunctionRecord> Functions;
   std::vector<std::pair<std::string, uint64_t>> FuncHashMismatches;
-  std::vector<std::pair<std::string, uint64_t>> FuncCounterMismatches;
 
   CoverageMapping() = default;
 
@@ -536,9 +535,7 @@ public:
   ///
   /// This is a count of functions whose profile is out of date or otherwise
   /// can't be associated with any coverage information.
-  unsigned getMismatchedCount() const {
-    return FuncHashMismatches.size() + FuncCounterMismatches.size();
-  }
+  unsigned getMismatchedCount() const { return FuncHashMismatches.size(); }
 
   /// A hash mismatch occurs when a profile record for a symbol does not have
   /// the same hash as a coverage mapping record for the same symbol. This
@@ -546,14 +543,6 @@ public:
   /// symbol name and its coverage mapping hash.
   ArrayRef<std::pair<std::string, uint64_t>> getHashMismatches() const {
     return FuncHashMismatches;
-  }
-
-  /// A counter mismatch occurs when there is an error when evaluating the
-  /// counter expressions in a coverage mapping record. This returns a list of
-  /// counter mismatches, where each mismatch is a pair of the symbol name and
-  /// the number of valid evaluated counter expressions.
-  ArrayRef<std::pair<std::string, uint64_t>> getCounterMismatches() const {
-    return FuncCounterMismatches;
   }
 
   /// Returns a lexicographically sorted, unique list of files that are
@@ -593,6 +582,87 @@ public:
   std::vector<InstantiationGroup>
   getInstantiationGroups(StringRef Filename) const;
 };
+
+/// Coverage statistics for a single line.
+class LineCoverageStats {
+  uint64_t ExecutionCount;
+  bool HasMultipleRegions;
+  bool Mapped;
+  unsigned Line;
+  ArrayRef<const CoverageSegment *> LineSegments;
+  const CoverageSegment *WrappedSegment;
+
+  friend class LineCoverageIterator;
+  LineCoverageStats() = default;
+
+public:
+  LineCoverageStats(ArrayRef<const CoverageSegment *> LineSegments,
+                    const CoverageSegment *WrappedSegment, unsigned Line);
+
+  uint64_t getExecutionCount() const { return ExecutionCount; }
+
+  bool hasMultipleRegions() const { return HasMultipleRegions; }
+
+  bool isMapped() const { return Mapped; }
+
+  unsigned getLine() const { return Line; }
+
+  ArrayRef<const CoverageSegment *> getLineSegments() const {
+    return LineSegments;
+  }
+
+  const CoverageSegment *getWrappedSegment() const { return WrappedSegment; }
+};
+
+/// An iterator over the \c LineCoverageStats objects for lines described by
+/// a \c CoverageData instance.
+class LineCoverageIterator
+    : public iterator_facade_base<
+          LineCoverageIterator, std::forward_iterator_tag, LineCoverageStats> {
+public:
+  LineCoverageIterator(const CoverageData &CD)
+      : LineCoverageIterator(CD, CD.begin()->Line) {}
+
+  LineCoverageIterator(const CoverageData &CD, unsigned Line)
+      : CD(CD), WrappedSegment(nullptr), Next(CD.begin()), Ended(false),
+        Line(Line), Segments(), Stats() {
+    this->operator++();
+  }
+
+  bool operator==(const LineCoverageIterator &R) const {
+    return &CD == &R.CD && Next == R.Next && Ended == R.Ended;
+  }
+
+  const LineCoverageStats &operator*() const { return Stats; }
+
+  LineCoverageStats &operator*() { return Stats; }
+
+  LineCoverageIterator &operator++();
+
+  LineCoverageIterator getEnd() const {
+    auto EndIt = *this;
+    EndIt.Next = CD.end();
+    EndIt.Ended = true;
+    return EndIt;
+  }
+
+private:
+  const CoverageData &CD;
+  const CoverageSegment *WrappedSegment;
+  std::vector<CoverageSegment>::const_iterator Next;
+  bool Ended;
+  unsigned Line;
+  SmallVector<const CoverageSegment *, 4> Segments;
+  LineCoverageStats Stats;
+};
+
+/// Get a \c LineCoverageIterator range for the lines described by \p CD.
+static inline iterator_range<LineCoverageIterator>
+getLineCoverageStats(const coverage::CoverageData &CD) {
+  auto Begin = LineCoverageIterator(CD);
+  auto End = Begin.getEnd();
+  return make_range(Begin, End);
+}
 
 // Profile coverage map has the following layout:
 // [CoverageMapFileHeader]

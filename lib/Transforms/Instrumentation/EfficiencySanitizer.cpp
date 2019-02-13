@@ -1,9 +1,8 @@
 //===-- EfficiencySanitizer.cpp - performance tuner -----------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -23,6 +22,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -33,7 +33,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
@@ -144,21 +143,6 @@ OverrideOptionsFromCL(EfficiencySanitizerOptions Options) {
   return Options;
 }
 
-// Create a constant for Str so that we can pass it to the run-time lib.
-static GlobalVariable *createPrivateGlobalForString(Module &M, StringRef Str,
-                                                    bool AllowMerging) {
-  Constant *StrConst = ConstantDataArray::getString(M.getContext(), Str);
-  // We use private linkage for module-local strings. If they can be merged
-  // with another one, we set the unnamed_addr attribute.
-  GlobalVariable *GV =
-    new GlobalVariable(M, StrConst->getType(), true,
-                       GlobalValue::PrivateLinkage, StrConst, "");
-  if (AllowMerging)
-    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-  GV->setAlignment(1);  // Strings may not be merged w/o setting align 1.
-  return GV;
-}
-
 /// EfficiencySanitizer: instrument each module to find performance issues.
 class EfficiencySanitizer : public ModulePass {
 public:
@@ -218,13 +202,13 @@ private:
   // Our slowpath involves callouts to the runtime library.
   // Access sizes are powers of two: 1, 2, 4, 8, 16.
   static const size_t NumberOfAccessSizes = 5;
-  Function *EsanAlignedLoad[NumberOfAccessSizes];
-  Function *EsanAlignedStore[NumberOfAccessSizes];
-  Function *EsanUnalignedLoad[NumberOfAccessSizes];
-  Function *EsanUnalignedStore[NumberOfAccessSizes];
+  FunctionCallee EsanAlignedLoad[NumberOfAccessSizes];
+  FunctionCallee EsanAlignedStore[NumberOfAccessSizes];
+  FunctionCallee EsanUnalignedLoad[NumberOfAccessSizes];
+  FunctionCallee EsanUnalignedStore[NumberOfAccessSizes];
   // For irregular sizes of any alignment:
-  Function *EsanUnalignedLoadN, *EsanUnalignedStoreN;
-  Function *MemmoveFn, *MemcpyFn, *MemsetFn;
+  FunctionCallee EsanUnalignedLoadN, EsanUnalignedStoreN;
+  FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
   Function *EsanCtorFunction;
   Function *EsanDtorFunction;
   // Remember the counter variable for each struct type to avoid
@@ -265,37 +249,31 @@ void EfficiencySanitizer::initializeCallbacks(Module &M) {
     // We'll inline the most common (i.e., aligned and frequent sizes)
     // load + store instrumentation: these callouts are for the slowpath.
     SmallString<32> AlignedLoadName("__esan_aligned_load" + ByteSizeStr);
-    EsanAlignedLoad[Idx] =
-        checkSanitizerInterfaceFunction(M.getOrInsertFunction(
-            AlignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy()));
+    EsanAlignedLoad[Idx] = M.getOrInsertFunction(
+        AlignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy());
     SmallString<32> AlignedStoreName("__esan_aligned_store" + ByteSizeStr);
-    EsanAlignedStore[Idx] =
-        checkSanitizerInterfaceFunction(M.getOrInsertFunction(
-            AlignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy()));
+    EsanAlignedStore[Idx] = M.getOrInsertFunction(
+        AlignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy());
     SmallString<32> UnalignedLoadName("__esan_unaligned_load" + ByteSizeStr);
-    EsanUnalignedLoad[Idx] =
-        checkSanitizerInterfaceFunction(M.getOrInsertFunction(
-            UnalignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy()));
+    EsanUnalignedLoad[Idx] = M.getOrInsertFunction(
+        UnalignedLoadName, IRB.getVoidTy(), IRB.getInt8PtrTy());
     SmallString<32> UnalignedStoreName("__esan_unaligned_store" + ByteSizeStr);
-    EsanUnalignedStore[Idx] =
-        checkSanitizerInterfaceFunction(M.getOrInsertFunction(
-            UnalignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy()));
+    EsanUnalignedStore[Idx] = M.getOrInsertFunction(
+        UnalignedStoreName, IRB.getVoidTy(), IRB.getInt8PtrTy());
   }
-  EsanUnalignedLoadN = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction("__esan_unaligned_loadN", IRB.getVoidTy(),
-                            IRB.getInt8PtrTy(), IntptrTy));
-  EsanUnalignedStoreN = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction("__esan_unaligned_storeN", IRB.getVoidTy(),
-                            IRB.getInt8PtrTy(), IntptrTy));
-  MemmoveFn = checkSanitizerInterfaceFunction(
+  EsanUnalignedLoadN = M.getOrInsertFunction(
+      "__esan_unaligned_loadN", IRB.getVoidTy(), IRB.getInt8PtrTy(), IntptrTy);
+  EsanUnalignedStoreN = M.getOrInsertFunction(
+      "__esan_unaligned_storeN", IRB.getVoidTy(), IRB.getInt8PtrTy(), IntptrTy);
+  MemmoveFn =
       M.getOrInsertFunction("memmove", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
-                            IRB.getInt8PtrTy(), IntptrTy));
-  MemcpyFn = checkSanitizerInterfaceFunction(
+                            IRB.getInt8PtrTy(), IntptrTy);
+  MemcpyFn =
       M.getOrInsertFunction("memcpy", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
-                            IRB.getInt8PtrTy(), IntptrTy));
-  MemsetFn = checkSanitizerInterfaceFunction(
+                            IRB.getInt8PtrTy(), IntptrTy);
+  MemsetFn =
       M.getOrInsertFunction("memset", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
-                            IRB.getInt32Ty(), IntptrTy));
+                            IRB.getInt32Ty(), IntptrTy);
 }
 
 bool EfficiencySanitizer::shouldIgnoreStructType(StructType *StructTy) {
@@ -526,10 +504,8 @@ void EfficiencySanitizer::createDestructor(Module &M, Constant *ToolInfoArg) {
                                       EsanModuleDtorName, &M);
   ReturnInst::Create(*Ctx, BasicBlock::Create(*Ctx, "", EsanDtorFunction));
   IRBuilder<> IRB_Dtor(EsanDtorFunction->getEntryBlock().getTerminator());
-  Function *EsanExit = checkSanitizerInterfaceFunction(
-      M.getOrInsertFunction(EsanExitName, IRB_Dtor.getVoidTy(),
-                            Int8PtrTy));
-  EsanExit->setLinkage(Function::ExternalLinkage);
+  FunctionCallee EsanExit =
+      M.getOrInsertFunction(EsanExitName, IRB_Dtor.getVoidTy(), Int8PtrTy);
   IRB_Dtor.CreateCall(EsanExit, {ToolInfoArg});
   appendToGlobalDtors(M, EsanDtorFunction, EsanCtorAndDtorPriority);
 }
@@ -537,7 +513,7 @@ void EfficiencySanitizer::createDestructor(Module &M, Constant *ToolInfoArg) {
 bool EfficiencySanitizer::initOnModule(Module &M) {
 
   Triple TargetTriple(M.getTargetTriple());
-  if (TargetTriple.getArch() == Triple::mips64 || TargetTriple.getArch() == Triple::mips64el)
+  if (TargetTriple.isMIPS64())
     ShadowParams = ShadowParams40;
   else
     ShadowParams = ShadowParams47;
@@ -685,7 +661,7 @@ bool EfficiencySanitizer::instrumentLoadOrStore(Instruction *I,
 
   Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
   const uint32_t TypeSizeBytes = DL.getTypeStoreSizeInBits(OrigTy) / 8;
-  Value *OnAccessFunc = nullptr;
+  FunctionCallee OnAccessFunc = nullptr;
 
   // Convert 0 to the default alignment.
   if (Alignment == 0)
@@ -814,7 +790,7 @@ bool EfficiencySanitizer::insertCounterUpdate(Instruction *I,
     ConstantExpr::getGetElementPtr(
         ArrayType::get(IRB.getInt64Ty(), getStructCounterSize(StructTy)),
         CounterArray, Indices);
-  Value *Load = IRB.CreateLoad(Counter);
+  Value *Load = IRB.CreateLoad(IRB.getInt64Ty(), Counter);
   IRB.CreateStore(IRB.CreateAdd(Load, ConstantInt::get(IRB.getInt64Ty(), 1)),
                   Counter);
   return true;
@@ -899,10 +875,11 @@ bool EfficiencySanitizer::instrumentFastpathWorkingSet(
   // memory access, if they are not already set.
   Value *ValueMask = ConstantInt::get(ShadowTy, 0x81); // 10000001B
 
-  Value *OldValue = IRB.CreateLoad(IRB.CreateIntToPtr(ShadowPtr, ShadowPtrTy));
+  Value *OldValue =
+      IRB.CreateLoad(ShadowTy, IRB.CreateIntToPtr(ShadowPtr, ShadowPtrTy));
   // The AND and CMP will be turned into a TEST instruction by the compiler.
   Value *Cmp = IRB.CreateICmpNE(IRB.CreateAnd(OldValue, ValueMask), ValueMask);
-  TerminatorInst *CmpTerm = SplitBlockAndInsertIfThen(Cmp, I, false);
+  Instruction *CmpTerm = SplitBlockAndInsertIfThen(Cmp, I, false);
   // FIXME: do I need to call SetCurrentDebugLocation?
   IRB.SetInsertPoint(CmpTerm);
   // We use OR to set the shadow bits to avoid corrupting the middle 6 bits,

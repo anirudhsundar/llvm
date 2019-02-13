@@ -1,9 +1,8 @@
 //===-- CommandLine.cpp - Command line parser implementation --------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,13 +18,13 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm-c/Support.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Config/config.h"
 #include "llvm/Support/ConvertUTF.h"
@@ -426,10 +425,15 @@ Option *CommandLineParser::LookupOption(SubCommand &Sub, StringRef &Arg,
     return I != Sub.OptionsMap.end() ? I->second : nullptr;
   }
 
-  // If the argument before the = is a valid option name, we match.  If not,
-  // return Arg unmolested.
+  // If the argument before the = is a valid option name and the option allows
+  // non-prefix form (ie is not AlwaysPrefix), we match.  If not, signal match
+  // failure by returning nullptr.
   auto I = Sub.OptionsMap.find(Arg.substr(0, EqualPos));
   if (I == Sub.OptionsMap.end())
+    return nullptr;
+
+  auto O = I->second;
+  if (O->getFormattingFlag() == cl::AlwaysPrefix)
     return nullptr;
 
   Value = Arg.substr(EqualPos + 1);
@@ -539,7 +543,9 @@ static inline bool ProvideOption(Option *Handler, StringRef ArgName,
   switch (Handler->getValueExpectedFlag()) {
   case ValueRequired:
     if (!Value.data()) { // No value specified?
-      if (i + 1 >= argc)
+      // If no other argument or the option only supports prefix form, we
+      // cannot look at the next argument.
+      if (i + 1 >= argc || Handler->getFormattingFlag() == cl::AlwaysPrefix)
         return Handler->error("requires a value!");
       // Steal the next argument, like for '-o filename'
       assert(argv && "null check");
@@ -597,7 +603,8 @@ static inline bool isGrouping(const Option *O) {
   return O->getFormattingFlag() == cl::Grouping;
 }
 static inline bool isPrefixedOrGrouping(const Option *O) {
-  return isGrouping(O) || O->getFormattingFlag() == cl::Prefix;
+  return isGrouping(O) || O->getFormattingFlag() == cl::Prefix ||
+         O->getFormattingFlag() == cl::AlwaysPrefix;
 }
 
 // getOptionPred - Check to see if there are any options that satisfy the
@@ -647,7 +654,8 @@ HandlePrefixedOrGroupedOption(StringRef &Arg, StringRef &Value,
   // If the option is a prefixed option, then the value is simply the
   // rest of the name...  so fall through to later processing, by
   // setting up the argument name flags and value fields.
-  if (PGOpt->getFormattingFlag() == cl::Prefix) {
+  if (PGOpt->getFormattingFlag() == cl::Prefix ||
+      PGOpt->getFormattingFlag() == cl::AlwaysPrefix) {
     Value = Arg.substr(Length);
     Arg = Arg.substr(0, Length);
     assert(OptionsMap.count(Arg) && OptionsMap.find(Arg)->second == PGOpt);
@@ -689,7 +697,13 @@ static bool EatsUnboundedNumberOfValues(const Option *O) {
          O->getNumOccurrencesFlag() == cl::OneOrMore;
 }
 
-static bool isWhitespace(char C) { return strchr(" \t\n\r\f\v", C); }
+static bool isWhitespace(char C) {
+  return C == ' ' || C == '\t' || C == '\r' || C == '\n';
+}
+
+static bool isWhitespaceOrNull(char C) {
+  return isWhitespace(C) || C == '\0';
+}
 
 static bool isQuote(char C) { return C == '\"' || C == '\''; }
 
@@ -710,17 +724,19 @@ void cl::TokenizeGNUCommandLine(StringRef Src, StringSaver &Saver,
         break;
     }
 
+    char C = Src[I];
+
     // Backslash escapes the next character.
-    if (I + 1 < E && Src[I] == '\\') {
+    if (I + 1 < E && C == '\\') {
       ++I; // Skip the escape.
       Token.push_back(Src[I]);
       continue;
     }
 
     // Consume a quoted string.
-    if (isQuote(Src[I])) {
-      char Quote = Src[I++];
-      while (I != E && Src[I] != Quote) {
+    if (isQuote(C)) {
+      ++I;
+      while (I != E && Src[I] != C) {
         // Backslash escapes the next character.
         if (Src[I] == '\\' && I + 1 != E)
           ++I;
@@ -733,7 +749,7 @@ void cl::TokenizeGNUCommandLine(StringRef Src, StringSaver &Saver,
     }
 
     // End the token if this is whitespace.
-    if (isWhitespace(Src[I])) {
+    if (isWhitespace(C)) {
       if (!Token.empty())
         NewArgv.push_back(Saver.save(StringRef(Token)).data());
       Token.clear();
@@ -741,7 +757,7 @@ void cl::TokenizeGNUCommandLine(StringRef Src, StringSaver &Saver,
     }
 
     // This is a normal character.  Append it.
-    Token.push_back(Src[I]);
+    Token.push_back(C);
   }
 
   // Append the last token after hitting EOF with no whitespace.
@@ -799,25 +815,27 @@ void cl::TokenizeWindowsCommandLine(StringRef Src, StringSaver &Saver,
   // end of the source string.
   enum { INIT, UNQUOTED, QUOTED } State = INIT;
   for (size_t I = 0, E = Src.size(); I != E; ++I) {
+    char C = Src[I];
+
     // INIT state indicates that the current input index is at the start of
     // the string or between tokens.
     if (State == INIT) {
-      if (isWhitespace(Src[I])) {
+      if (isWhitespaceOrNull(C)) {
         // Mark the end of lines in response files
-        if (MarkEOLs && Src[I] == '\n')
+        if (MarkEOLs && C == '\n')
           NewArgv.push_back(nullptr);
         continue;
       }
-      if (Src[I] == '"') {
+      if (C == '"') {
         State = QUOTED;
         continue;
       }
-      if (Src[I] == '\\') {
+      if (C == '\\') {
         I = parseBackslash(Src, I, Token);
         State = UNQUOTED;
         continue;
       }
-      Token.push_back(Src[I]);
+      Token.push_back(C);
       State = UNQUOTED;
       continue;
     }
@@ -826,38 +844,38 @@ void cl::TokenizeWindowsCommandLine(StringRef Src, StringSaver &Saver,
     // quotes.
     if (State == UNQUOTED) {
       // Whitespace means the end of the token.
-      if (isWhitespace(Src[I])) {
+      if (isWhitespaceOrNull(C)) {
         NewArgv.push_back(Saver.save(StringRef(Token)).data());
         Token.clear();
         State = INIT;
         // Mark the end of lines in response files
-        if (MarkEOLs && Src[I] == '\n')
+        if (MarkEOLs && C == '\n')
           NewArgv.push_back(nullptr);
         continue;
       }
-      if (Src[I] == '"') {
+      if (C == '"') {
         State = QUOTED;
         continue;
       }
-      if (Src[I] == '\\') {
+      if (C == '\\') {
         I = parseBackslash(Src, I, Token);
         continue;
       }
-      Token.push_back(Src[I]);
+      Token.push_back(C);
       continue;
     }
 
     // QUOTED state means that it's reading a token quoted by double quotes.
     if (State == QUOTED) {
-      if (Src[I] == '"') {
+      if (C == '"') {
         State = UNQUOTED;
         continue;
       }
-      if (Src[I] == '\\') {
+      if (C == '\\') {
         I = parseBackslash(Src, I, Token);
         continue;
       }
-      Token.push_back(Src[I]);
+      Token.push_back(C);
     }
   }
   // Append the last token after hitting EOF with no whitespace.
@@ -866,6 +884,45 @@ void cl::TokenizeWindowsCommandLine(StringRef Src, StringSaver &Saver,
   // Mark the end of response files
   if (MarkEOLs)
     NewArgv.push_back(nullptr);
+}
+
+void cl::tokenizeConfigFile(StringRef Source, StringSaver &Saver,
+                            SmallVectorImpl<const char *> &NewArgv,
+                            bool MarkEOLs) {
+  for (const char *Cur = Source.begin(); Cur != Source.end();) {
+    SmallString<128> Line;
+    // Check for comment line.
+    if (isWhitespace(*Cur)) {
+      while (Cur != Source.end() && isWhitespace(*Cur))
+        ++Cur;
+      continue;
+    }
+    if (*Cur == '#') {
+      while (Cur != Source.end() && *Cur != '\n')
+        ++Cur;
+      continue;
+    }
+    // Find end of the current line.
+    const char *Start = Cur;
+    for (const char *End = Source.end(); Cur != End; ++Cur) {
+      if (*Cur == '\\') {
+        if (Cur + 1 != End) {
+          ++Cur;
+          if (*Cur == '\n' ||
+              (*Cur == '\r' && (Cur + 1 != End) && Cur[1] == '\n')) {
+            Line.append(Start, Cur - 1);
+            if (*Cur == '\r')
+              ++Cur;
+            Start = Cur + 1;
+          }
+        }
+      } else if (*Cur == '\n')
+        break;
+    }
+    // Tokenize line.
+    Line.append(Start, Cur);
+    cl::TokenizeGNUCommandLine(Line, Saver, NewArgv, MarkEOLs);
+  }
 }
 
 // It is called byte order marker but the UTF-8 BOM is actually not affected
@@ -929,7 +986,7 @@ static bool ExpandResponseFile(StringRef FName, StringSaver &Saver,
   return true;
 }
 
-/// \brief Expand response files on a command line recursively using the given
+/// Expand response files on a command line recursively using the given
 /// StringSaver and tokenization strategy.
 bool cl::ExpandResponseFiles(StringSaver &Saver, TokenizerCallback Tokenizer,
                              SmallVectorImpl<const char *> &Argv,
@@ -972,6 +1029,15 @@ bool cl::ExpandResponseFiles(StringSaver &Saver, TokenizerCallback Tokenizer,
   return AllExpanded;
 }
 
+bool cl::readConfigFile(StringRef CfgFile, StringSaver &Saver,
+                        SmallVectorImpl<const char *> &Argv) {
+  if (!ExpandResponseFile(CfgFile, Saver, cl::tokenizeConfigFile, Argv,
+                          /*MarkEOLs*/ false, /*RelativeNames*/ true))
+    return false;
+  return ExpandResponseFiles(Saver, cl::tokenizeConfigFile, Argv,
+                             /*MarkEOLs*/ false, /*RelativeNames*/ true);
+}
+
 /// ParseEnvironmentOptions - An alternative entry point to the
 /// CommandLine library, which allows you to read the program's name
 /// from the caller (as PROGNAME) and its command-line arguments from
@@ -1003,8 +1069,27 @@ void cl::ParseEnvironmentOptions(const char *progName, const char *envVar,
 }
 
 bool cl::ParseCommandLineOptions(int argc, const char *const *argv,
-                                 StringRef Overview, raw_ostream *Errs) {
-  return GlobalParser->ParseCommandLineOptions(argc, argv, Overview,
+                                 StringRef Overview, raw_ostream *Errs,
+                                 const char *EnvVar) {
+  SmallVector<const char *, 20> NewArgv;
+  BumpPtrAllocator A;
+  StringSaver Saver(A);
+  NewArgv.push_back(argv[0]);
+
+  // Parse options from environment variable.
+  if (EnvVar) {
+    if (llvm::Optional<std::string> EnvValue =
+            sys::Process::GetEnv(StringRef(EnvVar)))
+      TokenizeGNUCommandLine(*EnvValue, Saver, NewArgv);
+  }
+
+  // Append options from command line.
+  for (int I = 1; I < argc; ++I)
+    NewArgv.push_back(argv[I]);
+  int NewArgc = static_cast<int>(NewArgv.size());
+
+  // Parse all options.
+  return GlobalParser->ParseCommandLineOptions(NewArgc, &NewArgv[0], Overview,
                                                Errs);
 }
 
@@ -1027,7 +1112,10 @@ bool CommandLineParser::ParseCommandLineOptions(int argc,
   SmallVector<const char *, 20> newArgv(argv, argv + argc);
   BumpPtrAllocator A;
   StringSaver Saver(A);
-  ExpandResponseFiles(Saver, TokenizeGNUCommandLine, newArgv);
+  ExpandResponseFiles(Saver,
+         Triple(sys::getProcessTriple()).isOSWindows() ?
+         cl::TokenizeWindowsCommandLine : cl::TokenizeGNUCommandLine,
+         newArgv);
   argv = &newArgv[0];
   argc = static_cast<int>(newArgv.size());
 
@@ -1213,8 +1301,15 @@ bool CommandLineParser::ParseCommandLineOptions(int argc,
 
     // If this is a named positional argument, just remember that it is the
     // active one...
-    if (Handler->getFormattingFlag() == cl::Positional)
+    if (Handler->getFormattingFlag() == cl::Positional) {
+      if ((Handler->getMiscFlags() & PositionalEatsArgs) && !Value.empty()) {
+        Handler->error("This argument does not take a value.\n"
+                       "\tInstead, it consumes any positional arguments until "
+                       "the next recognized option.", *Errs);
+        ErrorParsing = true;
+      }
       ActivePositionalArg = Handler;
+    }
     else
       ErrorParsing |= ProvideOption(Handler, ArgName, Value, argc, argv, i);
   }
@@ -1318,9 +1413,9 @@ bool CommandLineParser::ParseCommandLineOptions(int argc,
   // Now that we know if -debug is specified, we can use it.
   // Note that if ReadResponseFiles == true, this must be done before the
   // memory allocated for the expanded command line is free()d below.
-  DEBUG(dbgs() << "Args: ";
-        for (int i = 0; i < argc; ++i) dbgs() << argv[i] << ' ';
-        dbgs() << '\n';);
+  LLVM_DEBUG(dbgs() << "Args: ";
+             for (int i = 0; i < argc; ++i) dbgs() << argv[i] << ' ';
+             dbgs() << '\n';);
 
   // Free all of the memory allocated to the map.  Command line options may only
   // be processed once!
@@ -1339,15 +1434,15 @@ bool CommandLineParser::ParseCommandLineOptions(int argc,
 // Option Base class implementation
 //
 
-bool Option::error(const Twine &Message, StringRef ArgName) {
+bool Option::error(const Twine &Message, StringRef ArgName, raw_ostream &Errs) {
   if (!ArgName.data())
     ArgName = ArgStr;
   if (ArgName.empty())
-    errs() << HelpStr; // Be nice for positional arguments
+    Errs << HelpStr; // Be nice for positional arguments
   else
-    errs() << GlobalParser->ProgramName << ": for the -" << ArgName;
+    Errs << GlobalParser->ProgramName << ": for the -" << ArgName;
 
-  errs() << " option: " << Message << "\n";
+  Errs << " option: " << Message << "\n";
   return true;
 }
 
@@ -1383,17 +1478,23 @@ static StringRef getValueStr(const Option &O, StringRef DefaultMsg) {
   return O.ValueStr;
 }
 
+static StringRef ArgPrefix = "  -";
+static StringRef ArgHelpPrefix = " - ";
+static size_t ArgPrefixesSize = ArgPrefix.size() + ArgHelpPrefix.size();
+
 //===----------------------------------------------------------------------===//
 // cl::alias class implementation
 //
 
 // Return the width of the option tag for printing...
-size_t alias::getOptionWidth() const { return ArgStr.size() + 6; }
+size_t alias::getOptionWidth() const { return ArgStr.size() + ArgPrefixesSize; }
 
 void Option::printHelpStr(StringRef HelpStr, size_t Indent,
-                                 size_t FirstLineIndentedBy) {
+                          size_t FirstLineIndentedBy) {
+  assert(Indent >= FirstLineIndentedBy);
   std::pair<StringRef, StringRef> Split = HelpStr.split('\n');
-  outs().indent(Indent - FirstLineIndentedBy) << " - " << Split.first << "\n";
+  outs().indent(Indent - FirstLineIndentedBy)
+      << ArgHelpPrefix << Split.first << "\n";
   while (!Split.second.empty()) {
     Split = Split.second.split('\n');
     outs().indent(Indent) << Split.first << "\n";
@@ -1402,8 +1503,8 @@ void Option::printHelpStr(StringRef HelpStr, size_t Indent,
 
 // Print out the option for the alias.
 void alias::printOptionInfo(size_t GlobalWidth) const {
-  outs() << "  -" << ArgStr;
-  printHelpStr(HelpStr, GlobalWidth, ArgStr.size() + 6);
+  outs() << ArgPrefix << ArgStr;
+  printHelpStr(HelpStr, GlobalWidth, ArgStr.size() + ArgPrefixesSize);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1417,10 +1518,14 @@ void alias::printOptionInfo(size_t GlobalWidth) const {
 size_t basic_parser_impl::getOptionWidth(const Option &O) const {
   size_t Len = O.ArgStr.size();
   auto ValName = getValueName();
-  if (!ValName.empty())
-    Len += getValueStr(O, ValName).size() + 3;
+  if (!ValName.empty()) {
+    size_t FormattingLen = 3;
+    if (O.getMiscFlags() & PositionalEatsArgs)
+      FormattingLen = 6;
+    Len += getValueStr(O, ValName).size() + FormattingLen;
+  }
 
-  return Len + 6;
+  return Len + ArgPrefixesSize;
 }
 
 // printOptionInfo - Print out information about this option.  The
@@ -1428,18 +1533,23 @@ size_t basic_parser_impl::getOptionWidth(const Option &O) const {
 //
 void basic_parser_impl::printOptionInfo(const Option &O,
                                         size_t GlobalWidth) const {
-  outs() << "  -" << O.ArgStr;
+  outs() << ArgPrefix << O.ArgStr;
 
   auto ValName = getValueName();
-  if (!ValName.empty())
-    outs() << "=<" << getValueStr(O, ValName) << '>';
+  if (!ValName.empty()) {
+    if (O.getMiscFlags() & PositionalEatsArgs) {
+      outs() << " <" << getValueStr(O, ValName) << ">...";
+    } else {
+      outs() << "=<" << getValueStr(O, ValName) << '>';
+    }
+  }
 
   Option::printHelpStr(O.HelpStr, GlobalWidth, getOptionWidth(O));
 }
 
 void basic_parser_impl::printOptionName(const Option &O,
                                         size_t GlobalWidth) const {
-  outs() << "  -" << O.ArgStr;
+  outs() << ArgPrefix << O.ArgStr;
   outs().indent(GlobalWidth - O.ArgStr.size());
 }
 
@@ -1547,12 +1657,28 @@ unsigned generic_parser_base::findOption(StringRef Name) {
   return e;
 }
 
+static StringRef EqValue = "=<value>";
+static StringRef EmptyOption = "<empty>";
+static StringRef OptionPrefix = "    =";
+static size_t OptionPrefixesSize = OptionPrefix.size() + ArgHelpPrefix.size();
+
+static bool shouldPrintOption(StringRef Name, StringRef Description,
+                              const Option &O) {
+  return O.getValueExpectedFlag() != ValueOptional || !Name.empty() ||
+         !Description.empty();
+}
+
 // Return the width of the option tag for printing...
 size_t generic_parser_base::getOptionWidth(const Option &O) const {
   if (O.hasArgStr()) {
-    size_t Size = O.ArgStr.size() + 6;
-    for (unsigned i = 0, e = getNumOptions(); i != e; ++i)
-      Size = std::max(Size, getOption(i).size() + 8);
+    size_t Size = O.ArgStr.size() + ArgPrefixesSize + EqValue.size();
+    for (unsigned i = 0, e = getNumOptions(); i != e; ++i) {
+      StringRef Name = getOption(i);
+      if (!shouldPrintOption(Name, getDescription(i), O))
+        continue;
+      size_t NameSize = Name.empty() ? EmptyOption.size() : Name.size();
+      Size = std::max(Size, NameSize + OptionPrefixesSize);
+    }
     return Size;
   } else {
     size_t BaseSize = 0;
@@ -1568,13 +1694,38 @@ size_t generic_parser_base::getOptionWidth(const Option &O) const {
 void generic_parser_base::printOptionInfo(const Option &O,
                                           size_t GlobalWidth) const {
   if (O.hasArgStr()) {
-    outs() << "  -" << O.ArgStr;
-    Option::printHelpStr(O.HelpStr, GlobalWidth, O.ArgStr.size() + 6);
+    // When the value is optional, first print a line just describing the
+    // option without values.
+    if (O.getValueExpectedFlag() == ValueOptional) {
+      for (unsigned i = 0, e = getNumOptions(); i != e; ++i) {
+        if (getOption(i).empty()) {
+          outs() << ArgPrefix << O.ArgStr;
+          Option::printHelpStr(O.HelpStr, GlobalWidth,
+                               O.ArgStr.size() + ArgPrefixesSize);
+          break;
+        }
+      }
+    }
 
+    outs() << ArgPrefix << O.ArgStr << EqValue;
+    Option::printHelpStr(O.HelpStr, GlobalWidth,
+                         O.ArgStr.size() + EqValue.size() + ArgPrefixesSize);
     for (unsigned i = 0, e = getNumOptions(); i != e; ++i) {
-      size_t NumSpaces = GlobalWidth - getOption(i).size() - 8;
-      outs() << "    =" << getOption(i);
-      outs().indent(NumSpaces) << " -   " << getDescription(i) << '\n';
+      StringRef OptionName = getOption(i);
+      StringRef Description = getDescription(i);
+      if (!shouldPrintOption(OptionName, Description, O))
+        continue;
+      assert(GlobalWidth >= OptionName.size() + OptionPrefixesSize);
+      size_t NumSpaces = GlobalWidth - OptionName.size() - OptionPrefixesSize;
+      outs() << OptionPrefix << OptionName;
+      if (OptionName.empty()) {
+        outs() << EmptyOption;
+        assert(NumSpaces >= EmptyOption.size());
+        NumSpaces -= EmptyOption.size();
+      }
+      if (!Description.empty())
+        outs().indent(NumSpaces) << ArgHelpPrefix << "  " << Description;
+      outs() << '\n';
     }
   } else {
     if (!O.HelpStr.empty())

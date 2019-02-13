@@ -20,8 +20,14 @@ bool canCoerceMustAliasedValueToLoad(Value *StoredVal, Type *LoadTy,
       StoredVal->getType()->isStructTy() || StoredVal->getType()->isArrayTy())
     return false;
 
+  uint64_t StoreSize = DL.getTypeSizeInBits(StoredVal->getType());
+
+  // The store size must be byte-aligned to support future type casts.
+  if (llvm::alignTo(StoreSize, 8) != StoreSize)
+    return false;
+
   // The store has to be at least as big as the load.
-  if (DL.getTypeSizeInBits(StoredVal->getType()) < DL.getTypeSizeInBits(LoadTy))
+  if (StoreSize < DL.getTypeSizeInBits(LoadTy))
     return false;
 
   // Don't coerce non-integral pointers to integers or vice versa.
@@ -380,17 +386,17 @@ Value *getLoadValueForLoad(LoadInst *SrcVal, unsigned Offset, Type *LoadTy,
     // memdep queries will find the new load.  We can't easily remove the old
     // load completely because it is already in the value numbering table.
     IRBuilder<> Builder(SrcVal->getParent(), ++BasicBlock::iterator(SrcVal));
-    Type *DestPTy = IntegerType::get(LoadTy->getContext(), NewLoadSize * 8);
-    DestPTy =
-        PointerType::get(DestPTy, PtrVal->getType()->getPointerAddressSpace());
+    Type *DestTy = IntegerType::get(LoadTy->getContext(), NewLoadSize * 8);
+    Type *DestPTy =
+        PointerType::get(DestTy, PtrVal->getType()->getPointerAddressSpace());
     Builder.SetCurrentDebugLocation(SrcVal->getDebugLoc());
     PtrVal = Builder.CreateBitCast(PtrVal, DestPTy);
-    LoadInst *NewLoad = Builder.CreateLoad(PtrVal);
+    LoadInst *NewLoad = Builder.CreateLoad(DestTy, PtrVal);
     NewLoad->takeName(SrcVal);
     NewLoad->setAlignment(SrcVal->getAlignment());
 
-    DEBUG(dbgs() << "GVN WIDENED LOAD: " << *SrcVal << "\n");
-    DEBUG(dbgs() << "TO: " << *NewLoad << "\n");
+    LLVM_DEBUG(dbgs() << "GVN WIDENED LOAD: " << *SrcVal << "\n");
+    LLVM_DEBUG(dbgs() << "TO: " << *NewLoad << "\n");
 
     // Replace uses of the original load with the wider load.  On a big endian
     // system, we need to shift down to get the relevant bits.

@@ -3,6 +3,7 @@ tablegen(LLVM AttributesCompatFunc.inc -gen-attrs)
 add_public_tablegen_target(AttributeCompatFuncTableGen)
 
 add_llvm_library(LLVMCore
+  AbstractCallSite.cpp
   AsmWriter.cpp
   Attributes.cpp
   AutoUpgrade.cpp
@@ -22,7 +23,6 @@ add_llvm_library(LLVMCore
   DiagnosticPrinter.cpp
   Dominators.cpp
   Function.cpp
-  GCOV.cpp
   GVMaterializer.cpp
   Globals.cpp
   IRBuilder.cpp
@@ -42,8 +42,10 @@ add_llvm_library(LLVMCore
   Operator.cpp
   OptBisect.cpp
   Pass.cpp
+  PassInstrumentation.cpp
   PassManager.cpp
   PassRegistry.cpp
+  PassTimingInfo.cpp
   SafepointIRVerifier.cpp
   ProfileSummary.cpp
   Statepoint.cpp
@@ -53,7 +55,6 @@ add_llvm_library(LLVMCore
   User.cpp
   Value.cpp
   ValueSymbolTable.cpp
-  ValueTypes.cpp
   Verifier.cpp
 
   ADDITIONAL_HEADER_DIRS

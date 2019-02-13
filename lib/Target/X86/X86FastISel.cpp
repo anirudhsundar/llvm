@@ -1,9 +1,8 @@
 //===-- X86FastISel.cpp - X86 FastISel implementation ---------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -68,7 +67,7 @@ public:
 
   bool fastSelectInstruction(const Instruction *I) override;
 
-  /// \brief The specified machine instr operand is a vreg, and that
+  /// The specified machine instr operand is a vreg, and that
   /// vreg is being provided by the specified load instruction.  If possible,
   /// try to fold the load as an operand to the instruction, returning true if
   /// possible.
@@ -134,6 +133,8 @@ private:
   bool X86SelectFPExt(const Instruction *I);
   bool X86SelectFPTrunc(const Instruction *I);
   bool X86SelectSIToFP(const Instruction *I);
+  bool X86SelectUIToFP(const Instruction *I);
+  bool X86SelectIntToFP(const Instruction *I, bool IsSigned);
 
   const X86InstrInfo *getInstrInfo() const {
     return Subtarget->getInstrInfo();
@@ -210,14 +211,14 @@ getX86SSEConditionCode(CmpInst::Predicate Predicate) {
   case CmpInst::FCMP_ULT: NeedSwap = true; LLVM_FALLTHROUGH;
   case CmpInst::FCMP_UGT: CC = 6;          break;
   case CmpInst::FCMP_ORD: CC = 7;          break;
-  case CmpInst::FCMP_UEQ:
-  case CmpInst::FCMP_ONE: CC = 8;          break;
+  case CmpInst::FCMP_UEQ: CC = 8;          break;
+  case CmpInst::FCMP_ONE: CC = 12;         break;
   }
 
   return std::make_pair(CC, NeedSwap);
 }
 
-/// \brief Adds a complex addressing mode to the given machine instr builder.
+/// Adds a complex addressing mode to the given machine instr builder.
 /// Note, this will constrain the index register.  If its not possible to
 /// constrain the given index register, then a new one will be created.  The
 /// IndexReg field of the addressing mode will be updated to match in this case.
@@ -231,7 +232,7 @@ X86FastISel::addFullAddress(const MachineInstrBuilder &MIB,
   return ::addFullAddress(MIB, AM);
 }
 
-/// \brief Check if it is possible to fold the condition from the XALU intrinsic
+/// Check if it is possible to fold the condition from the XALU intrinsic
 /// into the user. The condition code will only be updated on success.
 bool X86FastISel::foldX86XALUIntrinsic(X86::CondCode &CC, const Instruction *I,
                                        const Value *Cond) {
@@ -310,8 +311,6 @@ bool X86FastISel::isTypeLegal(Type *Ty, MVT &VT, bool AllowI1) {
   return (AllowI1 && VT == MVT::i1) || TLI.isTypeLegal(VT);
 }
 
-#include "X86GenCallingConv.inc"
-
 /// X86FastEmitLoad - Emit a machine instruction to load a value of type VT.
 /// The address is either pre-computed, i.e. Ptr, or a GlobalAddress, i.e. GV.
 /// Return true and the result register by reference if it is possible.
@@ -351,7 +350,7 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
   case MVT::f32:
     if (X86ScalarSSEf32) {
       Opc = HasAVX512 ? X86::VMOVSSZrm : HasAVX ? X86::VMOVSSrm : X86::MOVSSrm;
-      RC  = &X86::FR32RegClass;
+      RC  = HasAVX512 ? &X86::FR32XRegClass : &X86::FR32RegClass;
     } else {
       Opc = X86::LD_Fp32m;
       RC  = &X86::RFP32RegClass;
@@ -360,7 +359,7 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
   case MVT::f64:
     if (X86ScalarSSEf64) {
       Opc = HasAVX512 ? X86::VMOVSDZrm : HasAVX ? X86::VMOVSDrm : X86::MOVSDrm;
-      RC  = &X86::FR64RegClass;
+      RC  = HasAVX512 ? &X86::FR64XRegClass : &X86::FR64RegClass;
     } else {
       Opc = X86::LD_Fp64m;
       RC  = &X86::RFP64RegClass;
@@ -379,7 +378,7 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
     else
       Opc = HasVLX ? X86::VMOVUPSZ128rm :
             HasAVX ? X86::VMOVUPSrm : X86::MOVUPSrm;
-    RC  = &X86::VR128RegClass;
+    RC = HasVLX ? &X86::VR128XRegClass : &X86::VR128RegClass;
     break;
   case MVT::v2f64:
     if (IsNonTemporal && Alignment >= 16 && HasSSE41)
@@ -391,7 +390,7 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
     else
       Opc = HasVLX ? X86::VMOVUPDZ128rm :
             HasAVX ? X86::VMOVUPDrm : X86::MOVUPDrm;
-    RC  = &X86::VR128RegClass;
+    RC = HasVLX ? &X86::VR128XRegClass : &X86::VR128RegClass;
     break;
   case MVT::v4i32:
   case MVT::v2i64:
@@ -406,7 +405,7 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
     else
       Opc = HasVLX ? X86::VMOVDQU64Z128rm :
             HasAVX ? X86::VMOVDQUrm : X86::MOVDQUrm;
-    RC  = &X86::VR128RegClass;
+    RC = HasVLX ? &X86::VR128XRegClass : &X86::VR128RegClass;
     break;
   case MVT::v8f32:
     assert(HasAVX);
@@ -418,19 +417,19 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
       Opc = HasVLX ? X86::VMOVAPSZ256rm : X86::VMOVAPSYrm;
     else
       Opc = HasVLX ? X86::VMOVUPSZ256rm : X86::VMOVUPSYrm;
-    RC  = &X86::VR256RegClass;
+    RC = HasVLX ? &X86::VR256XRegClass : &X86::VR256RegClass;
     break;
   case MVT::v4f64:
     assert(HasAVX);
     if (IsNonTemporal && Alignment >= 32 && HasAVX2)
-      Opc = X86::VMOVNTDQAYrm;
+      Opc = HasVLX ? X86::VMOVNTDQAZ256rm : X86::VMOVNTDQAYrm;
     else if (IsNonTemporal && Alignment >= 16)
       return false; // Force split for X86::VMOVNTDQArm
     else if (Alignment >= 32)
       Opc = HasVLX ? X86::VMOVAPDZ256rm : X86::VMOVAPDYrm;
     else
       Opc = HasVLX ? X86::VMOVUPDZ256rm : X86::VMOVUPDYrm;
-    RC  = &X86::VR256RegClass;
+    RC = HasVLX ? &X86::VR256XRegClass : &X86::VR256RegClass;
     break;
   case MVT::v8i32:
   case MVT::v4i64:
@@ -438,14 +437,14 @@ bool X86FastISel::X86FastEmitLoad(EVT VT, X86AddressMode &AM,
   case MVT::v32i8:
     assert(HasAVX);
     if (IsNonTemporal && Alignment >= 32 && HasAVX2)
-      Opc = X86::VMOVNTDQAYrm;
+      Opc = HasVLX ? X86::VMOVNTDQAZ256rm : X86::VMOVNTDQAYrm;
     else if (IsNonTemporal && Alignment >= 16)
       return false; // Force split for X86::VMOVNTDQArm
     else if (Alignment >= 32)
       Opc = HasVLX ? X86::VMOVDQA64Z256rm : X86::VMOVDQAYrm;
     else
       Opc = HasVLX ? X86::VMOVDQU64Z256rm : X86::VMOVDQUYrm;
-    RC  = &X86::VR256RegClass;
+    RC = HasVLX ? &X86::VR256XRegClass : &X86::VR256RegClass;
     break;
   case MVT::v16f32:
     assert(HasAVX512);
@@ -734,6 +733,10 @@ bool X86FastISel::handleConstantAddresses(const Value *V, X86AddressMode &AM) {
 
     // Can't handle TLS yet.
     if (GV->isThreadLocal())
+      return false;
+
+    // Can't handle !absolute_symbol references yet.
+    if (GV->isAbsoluteSymbolRef())
       return false;
 
     // RIP-relative addresses can't have additional register operands, so if
@@ -1193,7 +1196,7 @@ bool X86FastISel::X86SelectRet(const Instruction *I) {
 
   if (Ret->getNumOperands() > 0) {
     SmallVector<ISD::OutputArg, 4> Outs;
-    GetReturnInfo(F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
+    GetReturnInfo(CC, F.getReturnType(), F.getAttributes(), Outs, TLI, DL);
 
     // Analyze operands of the call, assigning locations to each operand.
     SmallVector<CCValAssign, 16> ValLocs;
@@ -1272,7 +1275,7 @@ bool X86FastISel::X86SelectRet(const Instruction *I) {
     unsigned Reg = X86MFInfo->getSRetReturnReg();
     assert(Reg &&
            "SRetReturnReg should have been set in LowerFormalArguments()!");
-    unsigned RetReg = Subtarget->is64Bit() ? X86::RAX : X86::EAX;
+    unsigned RetReg = Subtarget->isTarget64BitLP64() ? X86::RAX : X86::EAX;
     BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
             TII.get(TargetOpcode::COPY), RetReg).addReg(Reg);
     RetRegs.push_back(RetReg);
@@ -1342,6 +1345,7 @@ bool X86FastISel::X86SelectLoad(const Instruction *I) {
 }
 
 static unsigned X86ChooseCmpOpcode(EVT VT, const X86Subtarget *Subtarget) {
+  bool HasAVX512 = Subtarget->hasAVX512();
   bool HasAVX = Subtarget->hasAVX();
   bool X86ScalarSSEf32 = Subtarget->hasSSE1();
   bool X86ScalarSSEf64 = Subtarget->hasSSE2();
@@ -1353,9 +1357,15 @@ static unsigned X86ChooseCmpOpcode(EVT VT, const X86Subtarget *Subtarget) {
   case MVT::i32: return X86::CMP32rr;
   case MVT::i64: return X86::CMP64rr;
   case MVT::f32:
-    return X86ScalarSSEf32 ? (HasAVX ? X86::VUCOMISSrr : X86::UCOMISSrr) : 0;
+    return X86ScalarSSEf32
+               ? (HasAVX512 ? X86::VUCOMISSZrr
+                            : HasAVX ? X86::VUCOMISSrr : X86::UCOMISSrr)
+               : 0;
   case MVT::f64:
-    return X86ScalarSSEf64 ? (HasAVX ? X86::VUCOMISDrr : X86::UCOMISDrr) : 0;
+    return X86ScalarSSEf64
+               ? (HasAVX512 ? X86::VUCOMISDZrr
+                            : HasAVX ? X86::VUCOMISDrr : X86::UCOMISDrr)
+               : 0;
   }
 }
 
@@ -1426,9 +1436,6 @@ bool X86FastISel::X86SelectCmp(const Instruction *I) {
 
   MVT VT;
   if (!isTypeLegal(I->getOperand(0)->getType(), VT))
-    return false;
-
-  if (I->getType()->isIntegerTy(1) && Subtarget->hasAVX512())
     return false;
 
   // Try to optimize or fold the cmp.
@@ -1798,28 +1805,28 @@ bool X86FastISel::X86SelectShift(const Instruction *I) {
     CReg = X86::CX;
     RC = &X86::GR16RegClass;
     switch (I->getOpcode()) {
+    default: llvm_unreachable("Unexpected shift opcode");
     case Instruction::LShr: OpReg = X86::SHR16rCL; break;
     case Instruction::AShr: OpReg = X86::SAR16rCL; break;
     case Instruction::Shl:  OpReg = X86::SHL16rCL; break;
-    default: return false;
     }
   } else if (I->getType()->isIntegerTy(32)) {
     CReg = X86::ECX;
     RC = &X86::GR32RegClass;
     switch (I->getOpcode()) {
+    default: llvm_unreachable("Unexpected shift opcode");
     case Instruction::LShr: OpReg = X86::SHR32rCL; break;
     case Instruction::AShr: OpReg = X86::SAR32rCL; break;
     case Instruction::Shl:  OpReg = X86::SHL32rCL; break;
-    default: return false;
     }
   } else if (I->getType()->isIntegerTy(64)) {
     CReg = X86::RCX;
     RC = &X86::GR64RegClass;
     switch (I->getOpcode()) {
+    default: llvm_unreachable("Unexpected shift opcode");
     case Instruction::LShr: OpReg = X86::SHR64rCL; break;
     case Instruction::AShr: OpReg = X86::SAR64rCL; break;
     case Instruction::Shl:  OpReg = X86::SHL64rCL; break;
-    default: return false;
     }
   } else {
     return false;
@@ -1979,9 +1986,9 @@ bool X86FastISel::X86SelectDivRem(const Instruction *I) {
   // Generate the DIV/IDIV instruction.
   BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
           TII.get(OpEntry.OpDivRem)).addReg(Op1Reg);
-  // For i8 remainder, we can't reference AH directly, as we'll end
-  // up with bogus copies like %R9B = COPY %AH. Reference AX
-  // instead to prevent AH references in a REX instruction.
+  // For i8 remainder, we can't reference ah directly, as we'll end
+  // up with bogus copies like %r9b = COPY %ah. Reference ax
+  // instead to prevent ah references in a rex instruction.
   //
   // The current assumption of the fast register allocator is that isel
   // won't generate explicit references to the GR8_NOREX registers. If
@@ -2015,7 +2022,7 @@ bool X86FastISel::X86SelectDivRem(const Instruction *I) {
   return true;
 }
 
-/// \brief Emit a conditional move instruction (if the are supported) to lower
+/// Emit a conditional move instruction (if the are supported) to lower
 /// the select.
 bool X86FastISel::X86FastEmitCMoveSelect(MVT RetVT, const Instruction *I) {
   // Check if the subtarget supports these instructions.
@@ -2144,7 +2151,7 @@ bool X86FastISel::X86FastEmitCMoveSelect(MVT RetVT, const Instruction *I) {
   return true;
 }
 
-/// \brief Emit SSE or AVX instructions to lower the select.
+/// Emit SSE or AVX instructions to lower the select.
 ///
 /// Try to use SSE1/SSE2 instructions to simulate a select without branches.
 /// This lowers fp selects into a CMP/AND/ANDN/OR sequence when the necessary
@@ -2178,7 +2185,7 @@ bool X86FastISel::X86FastEmitSSESelect(MVT RetVT, const Instruction *I) {
   unsigned CC;
   bool NeedSwap;
   std::tie(CC, NeedSwap) = getX86SSEConditionCode(Predicate);
-  if (CC > 7)
+  if (CC > 7 && !Subtarget->hasAVX())
     return false;
 
   if (NeedSwap)
@@ -2406,14 +2413,19 @@ bool X86FastISel::X86SelectSelect(const Instruction *I) {
   return false;
 }
 
-bool X86FastISel::X86SelectSIToFP(const Instruction *I) {
+// Common code for X86SelectSIToFP and X86SelectUIToFP.
+bool X86FastISel::X86SelectIntToFP(const Instruction *I, bool IsSigned) {
   // The target-independent selection algorithm in FastISel already knows how
   // to select a SINT_TO_FP if the target is SSE but not AVX.
   // Early exit if the subtarget doesn't have AVX.
-  if (!Subtarget->hasAVX())
+  // Unsigned conversion requires avx512.
+  bool HasAVX512 = Subtarget->hasAVX512();
+  if (!Subtarget->hasAVX() || (!IsSigned && !HasAVX512))
     return false;
 
-  if (!I->getOperand(0)->getType()->isIntegerTy(32))
+  // TODO: We could sign extend narrower types.
+  MVT SrcVT = TLI.getSimpleValueType(DL, I->getOperand(0)->getType());
+  if (SrcVT != MVT::i32 && SrcVT != MVT::i64)
     return false;
 
   // Select integer to float/double conversion.
@@ -2421,20 +2433,31 @@ bool X86FastISel::X86SelectSIToFP(const Instruction *I) {
   if (OpReg == 0)
     return false;
 
-  const TargetRegisterClass *RC = nullptr;
   unsigned Opcode;
 
+  static const uint16_t SCvtOpc[2][2][2] = {
+    { { X86::VCVTSI2SSrr,  X86::VCVTSI642SSrr },
+      { X86::VCVTSI2SDrr,  X86::VCVTSI642SDrr } },
+    { { X86::VCVTSI2SSZrr, X86::VCVTSI642SSZrr },
+      { X86::VCVTSI2SDZrr, X86::VCVTSI642SDZrr } },
+  };
+  static const uint16_t UCvtOpc[2][2] = {
+    { X86::VCVTUSI2SSZrr, X86::VCVTUSI642SSZrr },
+    { X86::VCVTUSI2SDZrr, X86::VCVTUSI642SDZrr },
+  };
+  bool Is64Bit = SrcVT == MVT::i64;
+
   if (I->getType()->isDoubleTy()) {
-    // sitofp int -> double
-    Opcode = X86::VCVTSI2SDrr;
-    RC = &X86::FR64RegClass;
+    // s/uitofp int -> double
+    Opcode = IsSigned ? SCvtOpc[HasAVX512][1][Is64Bit] : UCvtOpc[1][Is64Bit];
   } else if (I->getType()->isFloatTy()) {
-    // sitofp int -> float
-    Opcode = X86::VCVTSI2SSrr;
-    RC = &X86::FR32RegClass;
+    // s/uitofp int -> float
+    Opcode = IsSigned ? SCvtOpc[HasAVX512][0][Is64Bit] : UCvtOpc[0][Is64Bit];
   } else
     return false;
 
+  MVT DstVT = TLI.getValueType(DL, I->getType()).getSimpleVT();
+  const TargetRegisterClass *RC = TLI.getRegClassFor(DstVT);
   unsigned ImplicitDefReg = createResultReg(RC);
   BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
           TII.get(TargetOpcode::IMPLICIT_DEF), ImplicitDefReg);
@@ -2442,6 +2465,14 @@ bool X86FastISel::X86SelectSIToFP(const Instruction *I) {
       fastEmitInst_rr(Opcode, RC, ImplicitDefReg, true, OpReg, false);
   updateValueMap(I, ResultReg);
   return true;
+}
+
+bool X86FastISel::X86SelectSIToFP(const Instruction *I) {
+  return X86SelectIntToFP(I, /*IsSigned*/true);
+}
+
+bool X86FastISel::X86SelectUIToFP(const Instruction *I) {
+  return X86SelectIntToFP(I, /*IsSigned*/false);
 }
 
 // Helper method used by X86SelectFPExt and X86SelectFPTrunc.
@@ -2480,9 +2511,13 @@ bool X86FastISel::X86SelectFPExtOrFPTrunc(const Instruction *I,
 bool X86FastISel::X86SelectFPExt(const Instruction *I) {
   if (X86ScalarSSEf64 && I->getType()->isDoubleTy() &&
       I->getOperand(0)->getType()->isFloatTy()) {
+    bool HasAVX512 = Subtarget->hasAVX512();
     // fpext from float to double.
-    unsigned Opc = Subtarget->hasAVX() ? X86::VCVTSS2SDrr : X86::CVTSS2SDrr;
-    return X86SelectFPExtOrFPTrunc(I, Opc, &X86::FR64RegClass);
+    unsigned Opc =
+        HasAVX512 ? X86::VCVTSS2SDZrr
+                  : Subtarget->hasAVX() ? X86::VCVTSS2SDrr : X86::CVTSS2SDrr;
+    return X86SelectFPExtOrFPTrunc(
+        I, Opc, HasAVX512 ? &X86::FR64XRegClass : &X86::FR64RegClass);
   }
 
   return false;
@@ -2491,9 +2526,13 @@ bool X86FastISel::X86SelectFPExt(const Instruction *I) {
 bool X86FastISel::X86SelectFPTrunc(const Instruction *I) {
   if (X86ScalarSSEf64 && I->getType()->isFloatTy() &&
       I->getOperand(0)->getType()->isDoubleTy()) {
+    bool HasAVX512 = Subtarget->hasAVX512();
     // fptrunc from double to float.
-    unsigned Opc = Subtarget->hasAVX() ? X86::VCVTSD2SSrr : X86::CVTSD2SSrr;
-    return X86SelectFPExtOrFPTrunc(I, Opc, &X86::FR32RegClass);
+    unsigned Opc =
+        HasAVX512 ? X86::VCVTSD2SSZrr
+                  : Subtarget->hasAVX() ? X86::VCVTSD2SSrr : X86::CVTSD2SSrr;
+    return X86SelectFPExtOrFPTrunc(
+        I, Opc, HasAVX512 ? &X86::FR32XRegClass : &X86::FR32RegClass);
   }
 
   return false;
@@ -2611,7 +2650,7 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
               TII.get(X86::VMOVPDI2DIrr), ResultReg)
           .addReg(InputReg, RegState::Kill);
-      
+
       // The result value is in the lower 16-bits of ResultReg.
       unsigned RegIdx = X86::sub_16bit;
       ResultReg = fastEmitInst_extractsubreg(MVT::i16, ResultReg, true, RegIdx);
@@ -2669,7 +2708,7 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
             (FrameReg == X86::EBP && VT == MVT::i32)) &&
            "Invalid Frame Register!");
 
-    // Always make a copy of the frame register to to a vreg first, so that we
+    // Always make a copy of the frame register to a vreg first, so that we
     // never directly reference the frame register (the TwoAddressInstruction-
     // Pass doesn't like that).
     unsigned SrcReg = createResultReg(RC);
@@ -2720,7 +2759,7 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
     if (MCI->getSourceAddressSpace() > 255 || MCI->getDestAddressSpace() > 255)
       return false;
 
-    return lowerCallTo(II, "memcpy", II->getNumArgOperands() - 2);
+    return lowerCallTo(II, "memcpy", II->getNumArgOperands() - 1);
   }
   case Intrinsic::memset: {
     const MemSetInst *MSI = cast<MemSetInst>(II);
@@ -2735,7 +2774,7 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
     if (MSI->getDestAddressSpace() > 255)
       return false;
 
-    return lowerCallTo(II, "memset", II->getNumArgOperands() - 2);
+    return lowerCallTo(II, "memset", II->getNumArgOperands() - 1);
   }
   case Intrinsic::stackprotector: {
     // Emit code to store the stack guard onto the stack.
@@ -2786,17 +2825,19 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
     // Unfortunately we can't use fastEmit_r, because the AVX version of FSQRT
     // is not generated by FastISel yet.
     // FIXME: Update this code once tablegen can handle it.
-    static const uint16_t SqrtOpc[2][2] = {
-      {X86::SQRTSSr, X86::VSQRTSSr},
-      {X86::SQRTSDr, X86::VSQRTSDr}
+    static const uint16_t SqrtOpc[3][2] = {
+      { X86::SQRTSSr,   X86::SQRTSDr },
+      { X86::VSQRTSSr,  X86::VSQRTSDr },
+      { X86::VSQRTSSZr, X86::VSQRTSDZr },
     };
-    bool HasAVX = Subtarget->hasAVX();
+    unsigned AVXLevel = Subtarget->hasAVX512() ? 2 :
+                        Subtarget->hasAVX()    ? 1 :
+                                                 0;
     unsigned Opc;
-    const TargetRegisterClass *RC;
     switch (VT.SimpleTy) {
     default: return false;
-    case MVT::f32: Opc = SqrtOpc[0][HasAVX]; RC = &X86::FR32RegClass; break;
-    case MVT::f64: Opc = SqrtOpc[1][HasAVX]; RC = &X86::FR64RegClass; break;
+    case MVT::f32: Opc = SqrtOpc[AVXLevel][0]; break;
+    case MVT::f64: Opc = SqrtOpc[AVXLevel][1]; break;
     }
 
     const Value *SrcVal = II->getArgOperand(0);
@@ -2805,8 +2846,9 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
     if (SrcReg == 0)
       return false;
 
+    const TargetRegisterClass *RC = TLI.getRegClassFor(VT);
     unsigned ImplicitDefReg = 0;
-    if (HasAVX) {
+    if (AVXLevel > 0) {
       ImplicitDefReg = createResultReg(RC);
       BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
               TII.get(TargetOpcode::IMPLICIT_DEF), ImplicitDefReg);
@@ -2855,23 +2897,15 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
         isCommutativeIntrinsic(II))
       std::swap(LHS, RHS);
 
-    bool UseIncDec = false;
-    if (isa<ConstantInt>(RHS) && cast<ConstantInt>(RHS)->isOne())
-      UseIncDec = true;
-
     unsigned BaseOpc, CondOpc;
     switch (II->getIntrinsicID()) {
     default: llvm_unreachable("Unexpected intrinsic!");
     case Intrinsic::sadd_with_overflow:
-      BaseOpc = UseIncDec ? unsigned(X86ISD::INC) : unsigned(ISD::ADD);
-      CondOpc = X86::SETOr;
-      break;
+      BaseOpc = ISD::ADD; CondOpc = X86::SETOr; break;
     case Intrinsic::uadd_with_overflow:
       BaseOpc = ISD::ADD; CondOpc = X86::SETBr; break;
     case Intrinsic::ssub_with_overflow:
-      BaseOpc = UseIncDec ? unsigned(X86ISD::DEC) : unsigned(ISD::SUB);
-      CondOpc = X86::SETOr;
-      break;
+      BaseOpc = ISD::SUB; CondOpc = X86::SETOr; break;
     case Intrinsic::usub_with_overflow:
       BaseOpc = ISD::SUB; CondOpc = X86::SETBr; break;
     case Intrinsic::smul_with_overflow:
@@ -2893,9 +2927,11 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
         { X86::DEC8r, X86::DEC16r, X86::DEC32r, X86::DEC64r }
       };
 
-      if (BaseOpc == X86ISD::INC || BaseOpc == X86ISD::DEC) {
+      if (CI->isOne() && (BaseOpc == ISD::ADD || BaseOpc == ISD::SUB) &&
+          CondOpc == X86::SETOr) {
+        // We can use INC/DEC.
         ResultReg = createResultReg(TLI.getRegClassFor(VT));
-        bool IsDec = BaseOpc == X86ISD::DEC;
+        bool IsDec = BaseOpc == ISD::SUB;
         BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                 TII.get(Opc[IsDec][VT.SimpleTy-MVT::i8]), ResultReg)
           .addReg(LHSReg, getKillRegState(LHSIsKill));
@@ -2983,18 +3019,22 @@ bool X86FastISel::fastLowerIntrinsicCall(const IntrinsicInst *II) {
     if (!isTypeLegal(RetTy, VT))
       return false;
 
-    static const uint16_t CvtOpc[2][2][2] = {
-      { { X86::CVTTSS2SIrr,   X86::VCVTTSS2SIrr   },
-        { X86::CVTTSS2SI64rr, X86::VCVTTSS2SI64rr }  },
-      { { X86::CVTTSD2SIrr,   X86::VCVTTSD2SIrr   },
-        { X86::CVTTSD2SI64rr, X86::VCVTTSD2SI64rr }  }
+    static const uint16_t CvtOpc[3][2][2] = {
+      { { X86::CVTTSS2SIrr,   X86::CVTTSS2SI64rr },
+        { X86::CVTTSD2SIrr,   X86::CVTTSD2SI64rr } },
+      { { X86::VCVTTSS2SIrr,  X86::VCVTTSS2SI64rr },
+        { X86::VCVTTSD2SIrr,  X86::VCVTTSD2SI64rr } },
+      { { X86::VCVTTSS2SIZrr, X86::VCVTTSS2SI64Zrr },
+        { X86::VCVTTSD2SIZrr, X86::VCVTTSD2SI64Zrr } },
     };
-    bool HasAVX = Subtarget->hasAVX();
+    unsigned AVXLevel = Subtarget->hasAVX512() ? 2 :
+                        Subtarget->hasAVX()    ? 1 :
+                                                 0;
     unsigned Opc;
     switch (VT.SimpleTy) {
     default: llvm_unreachable("Unexpected result type.");
-    case MVT::i32: Opc = CvtOpc[IsInputDouble][0][HasAVX]; break;
-    case MVT::i64: Opc = CvtOpc[IsInputDouble][1][HasAVX]; break;
+    case MVT::i32: Opc = CvtOpc[AVXLevel][IsInputDouble][0]; break;
+    case MVT::i64: Opc = CvtOpc[AVXLevel][IsInputDouble][1]; break;
     }
 
     // Check if we can fold insertelement instructions into the convert.
@@ -3161,9 +3201,20 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
       CLI.CS ? dyn_cast<CallInst>(CLI.CS->getInstruction()) : nullptr;
   const Function *CalledFn = CI ? CI->getCalledFunction() : nullptr;
 
+  // Call / invoke instructions with NoCfCheck attribute require special
+  // handling.
+  const auto *II =
+      CLI.CS ? dyn_cast<InvokeInst>(CLI.CS->getInstruction()) : nullptr;
+  if ((CI && CI->doesNoCfCheck()) || (II && II->doesNoCfCheck()))
+    return false;
+
   // Functions with no_caller_saved_registers that need special handling.
   if ((CI && CI->hasFnAttr("no_caller_saved_registers")) ||
       (CalledFn && CalledFn->hasFnAttribute("no_caller_saved_registers")))
+    return false;
+
+  // Functions using retpoline for indirect calls need to use SDISel.
+  if (Subtarget->useRetpolineIndirectCalls())
     return false;
 
   // Handle only C, fastcc, and webkit_js calling conventions for now.
@@ -3452,13 +3503,11 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
     assert(GV && "Not a direct call");
     // See if we need any target-specific flags on the GV operand.
     unsigned char OpFlags = Subtarget->classifyGlobalFunctionReference(GV);
-    // Ignore NonLazyBind attribute in FastISel
-    if (OpFlags == X86II::MO_GOTPCREL)
-      OpFlags = 0;
 
     // This will be a direct call, or an indirect call through memory for
     // NonLazyBind calls or dllimport calls.
-    bool NeedLoad = OpFlags == X86II::MO_DLLIMPORT;
+    bool NeedLoad =
+        OpFlags == X86II::MO_DLLIMPORT || OpFlags == X86II::MO_GOTPCREL;
     unsigned CallOpc = NeedLoad
                            ? (Is64Bit ? X86::CALL64m : X86::CALL32m)
                            : (Is64Bit ? X86::CALL64pcrel32 : X86::CALLpcrel32);
@@ -3517,16 +3566,6 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
     if ((CopyVT == MVT::f32 || CopyVT == MVT::f64) &&
         ((Is64Bit || Ins[i].Flags.isInReg()) && !Subtarget->hasSSE1())) {
       report_fatal_error("SSE register return with SSE disabled");
-    }
-
-    // If the return value is an i1 and AVX-512 is enabled, we need
-    // to do a fixup to make the copy legal.
-    if (CopyVT == MVT::i1 && SrcReg == X86::AL && Subtarget->hasAVX512()) {
-      // Need to copy to a GR32 first.
-      // TODO: MOVZX isn't great here. We don't care about the upper bits.
-      SrcReg = createResultReg(&X86::GR32RegClass);
-      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-              TII.get(X86::MOVZX32rr8), SrcReg).addReg(X86::AL);
     }
 
     // If we prefer to use the value in xmm registers, copy it out as f80 and
@@ -3604,6 +3643,8 @@ X86FastISel::fastSelectInstruction(const Instruction *I)  {
     return X86SelectFPTrunc(I);
   case Instruction::SIToFP:
     return X86SelectSIToFP(I);
+  case Instruction::UIToFP:
+    return X86SelectUIToFP(I);
   case Instruction::IntToPtr: // Deliberate fall-through.
   case Instruction::PtrToInt: {
     EVT SrcVT = TLI.getValueType(DL, I->getOperand(0)->getType());
@@ -3641,7 +3682,7 @@ X86FastISel::fastSelectInstruction(const Instruction *I)  {
     unsigned Reg = getRegForValue(I->getOperand(0));
     if (Reg == 0)
       return false;
-      
+
     // No instruction is needed for conversion. Reuse the register used by
     // the fist operand.
     updateValueMap(I, Reg);
@@ -3684,9 +3725,6 @@ unsigned X86FastISel::X86MaterializeInt(const ConstantInt *CI, MVT VT) {
   switch (VT.SimpleTy) {
   default: llvm_unreachable("Unexpected value type");
   case MVT::i1:
-    // TODO: Support this properly.
-    if (Subtarget->hasAVX512())
-      return 0;
     VT = MVT::i8;
     LLVM_FALLTHROUGH;
   case MVT::i8:  Opc = X86::MOV8ri;  break;
@@ -3694,21 +3732,13 @@ unsigned X86FastISel::X86MaterializeInt(const ConstantInt *CI, MVT VT) {
   case MVT::i32: Opc = X86::MOV32ri; break;
   case MVT::i64: {
     if (isUInt<32>(Imm))
-      Opc = X86::MOV32ri;
+      Opc = X86::MOV32ri64;
     else if (isInt<32>(Imm))
       Opc = X86::MOV64ri32;
     else
       Opc = X86::MOV64ri;
     break;
   }
-  }
-  if (VT == MVT::i64 && Opc == X86::MOV32ri) {
-    unsigned SrcReg = fastEmitInst_i(Opc, &X86::GR32RegClass, Imm);
-    unsigned ResultReg = createResultReg(&X86::GR64RegClass);
-    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-            TII.get(TargetOpcode::SUBREG_TO_REG), ResultReg)
-      .addImm(0).addReg(SrcReg).addImm(X86::sub_32bit);
-    return ResultReg;
   }
   return fastEmitInst_i(Opc, TLI.getRegClassFor(VT), Imm);
 }
@@ -3729,8 +3759,10 @@ unsigned X86FastISel::X86MaterializeFP(const ConstantFP *CFP, MVT VT) {
   default: return 0;
   case MVT::f32:
     if (X86ScalarSSEf32) {
-      Opc = Subtarget->hasAVX() ? X86::VMOVSSrm : X86::MOVSSrm;
-      RC  = &X86::FR32RegClass;
+      Opc = Subtarget->hasAVX512()
+                ? X86::VMOVSSZrm
+                : Subtarget->hasAVX() ? X86::VMOVSSrm : X86::MOVSSrm;
+      RC  = Subtarget->hasAVX512() ? &X86::FR32XRegClass : &X86::FR32RegClass;
     } else {
       Opc = X86::LD_Fp32m;
       RC  = &X86::RFP32RegClass;
@@ -3738,8 +3770,10 @@ unsigned X86FastISel::X86MaterializeFP(const ConstantFP *CFP, MVT VT) {
     break;
   case MVT::f64:
     if (X86ScalarSSEf64) {
-      Opc = Subtarget->hasAVX() ? X86::VMOVSDrm : X86::MOVSDrm;
-      RC  = &X86::FR64RegClass;
+      Opc = Subtarget->hasAVX512()
+                ? X86::VMOVSDZrm
+                : Subtarget->hasAVX() ? X86::VMOVSDrm : X86::MOVSDrm;
+      RC  = Subtarget->hasAVX512() ? &X86::FR64XRegClass : &X86::FR64RegClass;
     } else {
       Opc = X86::LD_Fp64m;
       RC  = &X86::RFP64RegClass;
@@ -3877,14 +3911,15 @@ unsigned X86FastISel::fastMaterializeFloatZero(const ConstantFP *CF) {
     return 0;
 
   // Get opcode and regclass for the given zero.
+  bool HasAVX512 = Subtarget->hasAVX512();
   unsigned Opc = 0;
   const TargetRegisterClass *RC = nullptr;
   switch (VT.SimpleTy) {
   default: return 0;
   case MVT::f32:
     if (X86ScalarSSEf32) {
-      Opc = X86::FsFLD0SS;
-      RC  = &X86::FR32RegClass;
+      Opc = HasAVX512 ? X86::AVX512_FsFLD0SS : X86::FsFLD0SS;
+      RC  = HasAVX512 ? &X86::FR32XRegClass : &X86::FR32RegClass;
     } else {
       Opc = X86::LD_Fp032;
       RC  = &X86::RFP32RegClass;
@@ -3892,8 +3927,8 @@ unsigned X86FastISel::fastMaterializeFloatZero(const ConstantFP *CF) {
     break;
   case MVT::f64:
     if (X86ScalarSSEf64) {
-      Opc = X86::FsFLD0SD;
-      RC  = &X86::FR64RegClass;
+      Opc = HasAVX512 ? X86::AVX512_FsFLD0SD : X86::FsFLD0SD;
+      RC  = HasAVX512 ? &X86::FR64XRegClass : &X86::FR64RegClass;
     } else {
       Opc = X86::LD_Fp064;
       RC  = &X86::RFP64RegClass;
@@ -3954,7 +3989,8 @@ bool X86FastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
   }
 
   Result->addMemOperand(*FuncInfo.MF, createMachineMemOperandFor(LI));
-  MI->eraseFromParent();
+  MachineBasicBlock::iterator I(MI);
+  removeDeadCode(I, std::next(I));
   return true;
 }
 
@@ -3970,7 +4006,7 @@ unsigned X86FastISel::fastEmitInst_rrrr(unsigned MachineInstOpcode,
   Op0 = constrainOperandRegClass(II, Op0, II.getNumDefs());
   Op1 = constrainOperandRegClass(II, Op1, II.getNumDefs() + 1);
   Op2 = constrainOperandRegClass(II, Op2, II.getNumDefs() + 2);
-  Op2 = constrainOperandRegClass(II, Op2, II.getNumDefs() + 3);
+  Op3 = constrainOperandRegClass(II, Op3, II.getNumDefs() + 3);
 
   if (II.getNumDefs() >= 1)
     BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, II, ResultReg)

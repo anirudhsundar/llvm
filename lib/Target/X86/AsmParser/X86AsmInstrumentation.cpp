@@ -1,9 +1,8 @@
 //===-- X86AsmInstrumentation.cpp - Instrument X86 inline assembly --------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,7 +37,7 @@
 // Currently we have only AddressSanitizer instrumentation, but we're
 // planning to implement MemorySanitizer for inline assembly too. If
 // you're not familiar with AddressSanitizer algorithm, please, read
-// https://code.google.com/p/address-sanitizer/wiki/AddressSanitizerAlgorithm.
+// https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm
 //
 // When inline assembly is parsed by an instance of X86AsmParser, all
 // instructions are emitted via EmitInstruction method. That's the
@@ -193,10 +192,8 @@ public:
   ~X86AddressSanitizer() override = default;
 
   // X86AsmInstrumentation implementation:
-  void InstrumentAndEmitInstruction(const MCInst &Inst,
-                                    OperandVector &Operands,
-                                    MCContext &Ctx,
-                                    const MCInstrInfo &MII,
+  void InstrumentAndEmitInstruction(const MCInst &Inst, OperandVector &Operands,
+                                    MCContext &Ctx, const MCInstrInfo &MII,
                                     MCStreamer &Out) override {
     InstrumentMOVS(Inst, Operands, Ctx, MII, Out);
     if (RepPrefix)
@@ -611,7 +608,7 @@ private:
     EmitInstruction(Out, MCInstBuilder(X86::CLD));
     EmitInstruction(Out, MCInstBuilder(X86::MMX_EMMS));
 
-    EmitInstruction(Out, MCInstBuilder(X86::AND64ri8)
+    EmitInstruction(Out, MCInstBuilder(X86::AND32ri8)
                              .addReg(X86::ESP)
                              .addReg(X86::ESP)
                              .addImm(-16));

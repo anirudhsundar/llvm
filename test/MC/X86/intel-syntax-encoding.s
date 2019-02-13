@@ -54,17 +54,20 @@
 
   acquire lock add [rax], rax
 // CHECK: encoding: [0xf2]
-// CHECK: encoding: [0xf0]
-// CHECK: encoding: [0x48,0x01,0x00]
+// CHECK: encoding: [0xf0,0x48,0x01,0x00]
   release lock add [rax], rax
 // CHECK: encoding: [0xf3]
-// CHECK: encoding: [0xf0]
-// CHECK: encoding: [0x48,0x01,0x00]
+// CHECK: encoding: [0xf0,0x48,0x01,0x00]
 
 // CHECK: encoding: [0x9c]
 // CHECK: encoding: [0x9d]
 pushf
 popf
+
+// CHECK: encoding: [0x66,0x9c]
+// CHECK: encoding: [0x66,0x9d]
+pushfw
+popfw
 
 LBB0_3:
 // CHECK: encoding: [0xeb,A]

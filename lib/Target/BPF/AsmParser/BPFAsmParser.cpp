@@ -1,9 +1,8 @@
 //===-- BPFAsmParser.cpp - Parse BPF assembly to MCInst instructions --===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,7 +27,10 @@ namespace {
 struct BPFOperand;
 
 class BPFAsmParser : public MCTargetAsmParser {
+
   SMLoc getLoc() const { return getParser().getTok().getLoc(); }
+
+  bool PreMatchCheck(OperandVector &Operands);
 
   bool MatchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
                                OperandVector &Operands, MCStreamer &Out,
@@ -66,7 +68,7 @@ public:
 
   BPFAsmParser(const MCSubtargetInfo &STI, MCAsmParser &Parser,
                const MCInstrInfo &MII, const MCTargetOptions &Options)
-      : MCTargetAsmParser(Options, STI) {
+      : MCTargetAsmParser(Options, STI, MII) {
     setAvailableFeatures(ComputeAvailableFeatures(STI.getFeatureBits()));
   }
 };
@@ -225,9 +227,6 @@ public:
         .Case("*", true)
         .Case("exit", true)
         .Case("lock", true)
-        .Case("bswap64", true)
-        .Case("bswap32", true)
-        .Case("bswap16", true)
         .Case("ld_pseudo", true)
         .Default(false);
   }
@@ -239,6 +238,12 @@ public:
         .Case("u32", true)
         .Case("u16", true)
         .Case("u8", true)
+        .Case("be64", true)
+        .Case("be32", true)
+        .Case("be16", true)
+        .Case("le64", true)
+        .Case("le32", true)
+        .Case("le16", true)
         .Case("goto", true)
         .Case("ll", true)
         .Case("skb", true)
@@ -252,12 +257,37 @@ public:
 #define GET_MATCHER_IMPLEMENTATION
 #include "BPFGenAsmMatcher.inc"
 
+bool BPFAsmParser::PreMatchCheck(OperandVector &Operands) {
+
+  if (Operands.size() == 4) {
+    // check "reg1 = -reg2" and "reg1 = be16/be32/be64/le16/le32/le64 reg2",
+    // reg1 must be the same as reg2
+    BPFOperand &Op0 = (BPFOperand &)*Operands[0];
+    BPFOperand &Op1 = (BPFOperand &)*Operands[1];
+    BPFOperand &Op2 = (BPFOperand &)*Operands[2];
+    BPFOperand &Op3 = (BPFOperand &)*Operands[3];
+    if (Op0.isReg() && Op1.isToken() && Op2.isToken() && Op3.isReg()
+        && Op1.getToken() == "="
+        && (Op2.getToken() == "-" || Op2.getToken() == "be16"
+            || Op2.getToken() == "be32" || Op2.getToken() == "be64"
+            || Op2.getToken() == "le16" || Op2.getToken() == "le32"
+            || Op2.getToken() == "le64")
+        && Op0.getReg() != Op3.getReg())
+      return true;
+  }
+
+  return false;
+}
+
 bool BPFAsmParser::MatchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
                                            OperandVector &Operands,
                                            MCStreamer &Out, uint64_t &ErrorInfo,
                                            bool MatchingInlineAsm) {
   MCInst Inst;
   SMLoc ErrorLoc;
+
+  if (PreMatchCheck(Operands))
+    return Error(IDLoc, "additional inst constraint not met");
 
   switch (MatchInstructionImpl(Operands, Inst, ErrorInfo, MatchingInlineAsm)) {
   default:
@@ -324,15 +354,10 @@ BPFAsmParser::parseOperandAsOperator(OperandVector &Operands) {
   switch (getLexer().getKind()) {
   case AsmToken::Minus:
   case AsmToken::Plus: {
-    StringRef Name = getLexer().getTok().getString();
-
     if (getLexer().peekTok().is(AsmToken::Integer))
       return MatchOperand_NoMatch;
-
-    getLexer().Lex();
-    Operands.push_back(BPFOperand::createToken(Name, S));
+    LLVM_FALLTHROUGH;
   }
-  // Fall through.
 
   case AsmToken::Equal:
   case AsmToken::Greater:
@@ -434,7 +459,7 @@ bool BPFAsmParser::ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
   } else if (BPFOperand::isValidIdAtStart (Name))
     Operands.push_back(BPFOperand::createToken(Name, NameLoc));
   else
-    return true;
+    return Error(NameLoc, "invalid register/token name");
 
   while (!getLexer().is(AsmToken::EndOfStatement)) {
     // Attempt to parse token as operator
@@ -446,8 +471,10 @@ bool BPFAsmParser::ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
       continue;
 
     // Attempt to parse token as an immediate
-    if (parseImmediate(Operands) != MatchOperand_Success)
-      return true;
+    if (parseImmediate(Operands) != MatchOperand_Success) {
+      SMLoc Loc = getLexer().getLoc();
+      return Error(Loc, "unexpected token");
+    }
   }
 
   if (getLexer().isNot(AsmToken::EndOfStatement)) {

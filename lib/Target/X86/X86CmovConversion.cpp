@@ -1,11 +1,11 @@
-//====-- X86CmovConversion.cpp - Convert Cmov to Branch -------------------===//
+//====- X86CmovConversion.cpp - Convert Cmov to Branch --------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+//
 /// \file
 /// This file implements a pass that converts X86 cmov instructions into
 /// branches when profitable. This pass is conservative. It transforms if and
@@ -31,36 +31,55 @@
 ///         25% branch misprediction.
 ///
 /// Note: This pass is assumed to run on SSA machine code.
+//
 //===----------------------------------------------------------------------===//
 //
 //  External interfaces:
 //      FunctionPass *llvm::createX86CmovConverterPass();
 //      bool X86CmovConverterPass::runOnMachineFunction(MachineFunction &MF);
 //
+//===----------------------------------------------------------------------===//
 
 #include "X86.h"
 #include "X86InstrInfo.h"
-#include "X86Subtarget.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSchedule.h"
-#include "llvm/IR/InstIterator.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/MC/MCSchedule.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cassert>
+#include <iterator>
+#include <utility>
+
 using namespace llvm;
 
-#define DEBUG_TYPE "x86-cmov-converter"
+#define DEBUG_TYPE "x86-cmov-conversion"
 
 STATISTIC(NumOfSkippedCmovGroups, "Number of unsupported CMOV-groups");
 STATISTIC(NumOfCmovGroupCandidate, "Number of CMOV-group candidates");
 STATISTIC(NumOfLoopCandidate, "Number of CMOV-conversion profitable loops");
 STATISTIC(NumOfOptimizedCmovGroups, "Number of optimized CMOV-groups");
 
-namespace {
 // This internal switch can be used to turn off the cmov/branch optimization.
 static cl::opt<bool>
     EnableCmovConverter("x86-cmov-converter",
@@ -77,28 +96,31 @@ static cl::opt<bool> ForceMemOperand(
     cl::desc("Convert cmovs to branches whenever they have memory operands."),
     cl::init(true), cl::Hidden);
 
+namespace {
+
 /// Converts X86 cmov instructions into branches when profitable.
 class X86CmovConverterPass : public MachineFunctionPass {
 public:
-  X86CmovConverterPass() : MachineFunctionPass(ID) {}
-  ~X86CmovConverterPass() {}
+  X86CmovConverterPass() : MachineFunctionPass(ID) {
+    initializeX86CmovConverterPassPass(*PassRegistry::getPassRegistry());
+  }
 
   StringRef getPassName() const override { return "X86 cmov Conversion"; }
   bool runOnMachineFunction(MachineFunction &MF) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
-private:
   /// Pass identification, replacement for typeid.
   static char ID;
 
+private:
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
   const TargetRegisterInfo *TRI;
   TargetSchedModel TSchedModel;
 
   /// List of consecutive CMOV instructions.
-  typedef SmallVector<MachineInstr *, 2> CmovGroup;
-  typedef SmallVector<CmovGroup, 2> CmovGroups;
+  using CmovGroup = SmallVector<MachineInstr *, 2>;
+  using CmovGroups = SmallVector<CmovGroup, 2>;
 
   /// Collect all CMOV-group-candidates in \p CurrLoop and update \p
   /// CmovInstGroups accordingly.
@@ -125,6 +147,8 @@ private:
   void convertCmovInstsToBranches(SmallVectorImpl<MachineInstr *> &Group) const;
 };
 
+} // end anonymous namespace
+
 char X86CmovConverterPass::ID = 0;
 
 void X86CmovConverterPass::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -133,13 +157,13 @@ void X86CmovConverterPass::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 bool X86CmovConverterPass::runOnMachineFunction(MachineFunction &MF) {
-  if (skipFunction(*MF.getFunction()))
+  if (skipFunction(MF.getFunction()))
     return false;
   if (!EnableCmovConverter)
     return false;
 
-  DEBUG(dbgs() << "********** " << getPassName() << " : " << MF.getName()
-               << "**********\n");
+  LLVM_DEBUG(dbgs() << "********** " << getPassName() << " : " << MF.getName()
+                    << "**********\n");
 
   bool Changed = false;
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfo>();
@@ -147,7 +171,7 @@ bool X86CmovConverterPass::runOnMachineFunction(MachineFunction &MF) {
   MRI = &MF.getRegInfo();
   TII = STI.getInstrInfo();
   TRI = STI.getRegisterInfo();
-  TSchedModel.init(STI.getSchedModel(), &STI, TII);
+  TSchedModel.init(&STI);
 
   // Before we handle the more subtle cases of register-register CMOVs inside
   // of potentially hot loops, we want to quickly remove all CMOVs with
@@ -263,6 +287,9 @@ bool X86CmovConverterPass::collectCmovCandidates(
     bool SkipGroup = false;
 
     for (auto &I : *MBB) {
+      // Skip debug instructions.
+      if (I.isDebugInstr())
+        continue;
       X86::CondCode CC = X86::getCondFromCMovOpc(I.getOpcode());
       // Check if we found a X86::CMOVrr instruction.
       if (CC != X86::COND_INVALID && (IncludeLoads || !I.mayLoad())) {
@@ -400,6 +427,9 @@ bool X86CmovConverterPass::checkForProfitableCmovCandidates(
       // Clear physical registers Def map.
       RegDefMaps[PhyRegType].clear();
       for (MachineInstr &MI : *MBB) {
+        // Skip debug instructions.
+        if (MI.isDebugInstr())
+          continue;
         unsigned MIDepth = 0;
         unsigned MIDepthOpt = 0;
         bool IsCMOV = CmovInstructions.count(&MI);
@@ -558,10 +588,35 @@ static bool checkEFLAGSLive(MachineInstr *MI) {
   return false;
 }
 
+/// Given /p First CMOV instruction and /p Last CMOV instruction representing a
+/// group of CMOV instructions, which may contain debug instructions in between,
+/// move all debug instructions to after the last CMOV instruction, making the
+/// CMOV group consecutive.
+static void packCmovGroup(MachineInstr *First, MachineInstr *Last) {
+  assert(X86::getCondFromCMovOpc(Last->getOpcode()) != X86::COND_INVALID &&
+         "Last instruction in a CMOV group must be a CMOV instruction");
+
+  SmallVector<MachineInstr *, 2> DBGInstructions;
+  for (auto I = First->getIterator(), E = Last->getIterator(); I != E; I++) {
+    if (I->isDebugInstr())
+      DBGInstructions.push_back(&*I);
+  }
+
+  // Splice the debug instruction after the cmov group.
+  MachineBasicBlock *MBB = First->getParent();
+  for (auto *MI : DBGInstructions)
+    MBB->insertAfter(Last, MI->removeFromParent());
+}
+
 void X86CmovConverterPass::convertCmovInstsToBranches(
     SmallVectorImpl<MachineInstr *> &Group) const {
   assert(!Group.empty() && "No CMOV instructions to convert");
   ++NumOfOptimizedCmovGroups;
+
+  // If the CMOV group is not packed, e.g., there are debug instructions between
+  // first CMOV and last CMOV, then pack the group and make the CMOV instruction
+  // consecutive by moving the debug instructions to after the last CMOV.
+  packCmovGroup(Group.front(), Group.back());
 
   // To convert a CMOVcc instruction, we actually have to insert the diamond
   // control-flow pattern.  The incoming instruction knows the destination vreg
@@ -660,7 +715,7 @@ void X86CmovConverterPass::convertCmovInstsToBranches(
           MI.getOperand(X86::getCondFromCMovOpc(MI.getOpcode()) == CC ? 1 : 2)
               .getReg();
       // Walk back through any intermediate cmovs referenced.
-      for (;;) {
+      while (true) {
         auto FRIt = FalseBBRegRewriteTable.find(FalseReg);
         if (FRIt == FalseBBRegRewriteTable.end())
           break;
@@ -714,7 +769,7 @@ void X86CmovConverterPass::convertCmovInstsToBranches(
     auto *NewCMOV = NewMIs.pop_back_val();
     assert(X86::getCondFromCMovOpc(NewCMOV->getOpcode()) == OppCC &&
            "Last new instruction isn't the expected CMOV!");
-    DEBUG(dbgs() << "\tRewritten cmov: "; NewCMOV->dump());
+    LLVM_DEBUG(dbgs() << "\tRewritten cmov: "; NewCMOV->dump());
     MBB->insert(MachineBasicBlock::iterator(MI), NewCMOV);
     if (&*MIItBegin == &MI)
       MIItBegin = MachineBasicBlock::iterator(NewCMOV);
@@ -722,7 +777,7 @@ void X86CmovConverterPass::convertCmovInstsToBranches(
     // Sink whatever instructions were needed to produce the unfolded operand
     // into the false block.
     for (auto *NewMI : NewMIs) {
-      DEBUG(dbgs() << "\tRewritten load instr: "; NewMI->dump());
+      LLVM_DEBUG(dbgs() << "\tRewritten load instr: "; NewMI->dump());
       FalseMBB->insert(FalseInsertionPoint, NewMI);
       // Re-map any operands that are from other cmovs to the inputs for this block.
       for (auto &MOp : NewMI->uses()) {
@@ -784,8 +839,8 @@ void X86CmovConverterPass::convertCmovInstsToBranches(
               .addReg(Op2Reg)
               .addMBB(MBB);
     (void)MIB;
-    DEBUG(dbgs() << "\tFrom: "; MIIt->dump());
-    DEBUG(dbgs() << "\tTo: "; MIB->dump());
+    LLVM_DEBUG(dbgs() << "\tFrom: "; MIIt->dump());
+    LLVM_DEBUG(dbgs() << "\tTo: "; MIB->dump());
 
     // Add this PHI to the rewrite table.
     RegRewriteTable[DestReg] = std::make_pair(Op1Reg, Op2Reg);
@@ -795,7 +850,11 @@ void X86CmovConverterPass::convertCmovInstsToBranches(
   MBB->erase(MIItBegin, MIItEnd);
 }
 
-} // End anonymous namespace.
+INITIALIZE_PASS_BEGIN(X86CmovConverterPass, DEBUG_TYPE, "X86 cmov Conversion",
+                      false, false)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
+INITIALIZE_PASS_END(X86CmovConverterPass, DEBUG_TYPE, "X86 cmov Conversion",
+                    false, false)
 
 FunctionPass *llvm::createX86CmovConverterPass() {
   return new X86CmovConverterPass();
